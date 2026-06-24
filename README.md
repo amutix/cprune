@@ -4,7 +4,16 @@ Context pruning extension for Pi. It reduces duplicate, append-only, stale, and 
 
 Append/contained pruning detects exact byte prefixes, normalized line-prefixes, substantial normalized contained blocks, and repeated line chunks, so it can catch repeated output with new lines appended even when ANSI escapes, CRLF/LF, trailing whitespace, small wrappers, or some middle insertions differ. Older repeated read-only snapshot commands such as `rg`, `find`, `ls`, and `git status` are also pruned when the same command is run again later. Old custom extension messages are deduped/truncated generically, structured entity notifications are compacted when superseded, and boilerplate “run/show for full context” tails are stripped without hardcoding one extension.
 
-Entity-aware pruning is generic rather than tied to one extension: it detects IDs like `TASK-123`, `SPEC-12`, `DISC-3`, `ISSUE-9`, `PR-42`, etc., then applies a latest-entity-snapshot-wins policy across older user messages, custom extension messages, tool results, assistant text, and summaries while preserving IDs, hashes, and short previews. Old successful assistant tool calls can be compacted to tool name, IDs/paths, hash, and preview, so large prior spec/comment bodies do not remain in request context. Non-core tool results with the same tool+entity are also superseded by newer successful results. Stats include entity-family counts/savings such as `TASK-*`, `SPEC-*`, and `DISC-*`.
+Entity-aware pruning is generic rather than tied to one extension: it detects IDs like `TASK-123`, `SPEC-12`, `DISC-3`, `ISSUE-9`, `PR-42`, etc., then applies a latest-entity-snapshot-wins policy across older user messages, custom extension messages, tool results, assistant text, and summaries while preserving IDs, hashes, and short previews. Old successful assistant tool calls can be compacted to tool name, IDs/paths, hash, and preview, so large prior spec/comment bodies do not remain in request context. Non-core tool results with the same tool+entity are also superseded by newer successful results.
+
+## Highlights
+
+- Three operating modes: **off**, **safe**, and **full**.
+- `/cprune` shows a compact off/safe/full comparison with red/orange/green bars.
+- Conservative persist-time pruning handles exact/normalized duplicates, append repeats, and oversized tool results.
+- Prompt-time pruning removes stale, duplicate, oversized, or explicitly user-excluded context before model calls.
+- `/cprune review` and `/cprune review-prompts` let users explicitly exclude large entries or prompt/response turns without rewriting Pi history.
+- `/cprune compact` requests Pi's supported lossy compaction mechanism.
 
 ## Safety and information loss
 
@@ -29,12 +38,18 @@ Risk levels:
 
 Recommended wording: cprune uses **conservative near-lossless persist-time pruning** plus **non-destructive but lossy-at-prompt-time pruning**. It preserves recent context, errors, entity IDs, hashes, previews, and re-run hints, but it may remove historical details from saved tool results in safe mechanical cases and from the model request in broader prompt-time cases.
 
-## Use
+## Install / use
 
 From this directory:
 
 ```bash
 pi -e ./src/cprune.ts
+```
+
+Or install from GitHub:
+
+```bash
+pi install git:github.com/amutix/cprune
 ```
 
 Or install/configure it as a Pi package; `package.json` exposes `src/cprune.ts` under the `pi.extensions` field.
