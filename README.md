@@ -42,8 +42,7 @@ Or install/configure it as a Pi package; `package.json` exposes `src/cprune.ts` 
 ## Commands
 
 ```text
-/cprune status             Show cumulative pruning counters
-/cprune stats              Compare raw context vs simulated cprune-pruned context
+/cprune                    Compare off/safe/full context sizes
 /cprune review             Pick large older context entries to exclude from future prompts
 /cprune review-prompts [safe|full] [N] [page] Pick a prompt/response turn from history
 /cprune clear-exclusions   Clear user-approved prompt-time exclusions
@@ -55,18 +54,9 @@ Or install/configure it as a Pi package; `package.json` exposes `src/cprune.ts` 
 
 ## Tool
 
-cprune also registers an LLM-callable tool named `cprune_status` with actions:
+cprune also registers an LLM-callable tool named `cprune_status`. Omitting `action` returns the same off/safe/full comparison as `/cprune`; actions `safe`, `full`, `off`, and `compact` change mode or request lossy compaction.
 
-```text
-status        Show cumulative pruning counters
-stats         Compare off/safe/full context sizes
-safe          Enable conservative pruning
-full          Enable full/aggressive pruning (`on` is an alias)
-off           Disable pruning
-compact       Lossily compact/prune context via Pi compaction
-```
-
-`/cprune stats` and `cprune_status action="stats"` work in any mode, so you can compare estimated savings before enabling pruning. (`stat` and the old `context-stat` action are accepted as aliases.) The output compares **off** (red), **safe** (orange), and **full** (green), then shows safe/full breakdowns by context part, per-rule hit counts, per-rule character savings, and any user-approved exclusions.
+`/cprune` works in any mode, so you can compare estimated savings before enabling pruning. The output compares **off** (red), **safe** (orange), and **full** (green), includes the useful state counters from the old status view, then shows safe/full breakdowns by context part, per-rule hit counts, per-rule character savings, and any user-approved exclusions.
 
 `/cprune review-prompts [safe|full] [N] [page]` is useful after accidentally pushing a noisy prompt/response/tool-output turn into context. Safe mode is the default and mirrors Pi prompt behavior: it skips hidden shell entries such as `!!cmd` because Pi marks them `excludeFromContext`, while keeping normal `!cmd` entries as selectable shell-command items. Full mode shows raw branch history, including hidden `!!cmd` entries, for users who want complete visibility. The selected turn is excluded from future prompts when it appears in model context; Pi session entries are not deleted. Results are paginated; jump directly with e.g. `/cprune review-prompts safe 50 2` or `/cprune review-prompts full 50`.
 

@@ -1457,7 +1457,7 @@ function currentContextMessages(ctx: any): AnyMessage[] {
   if (Array.isArray(built?.messages)) return built.messages;
 
   // Fallback for older SDK shapes. This is less exact because it does not convert
-  // compaction/custom entries, but keeps /cprune stats useful.
+  // compaction/custom entries, but keeps /cprune useful.
   const branch = ctx.sessionManager?.getBranch?.() ?? [];
   return branch
     .map((entry: any) => {
@@ -1719,12 +1719,14 @@ function contextStatText(ctx: any): string {
   const fullPct = off.before.chars > 0 ? (fullSaved / off.before.chars) * 100 : 0;
 
   return [
-    "cprune stats",
+    "cprune",
     "",
     "Summary",
     `  active mode       : ${mode}`,
     `  model context     : ${modelUsage}`,
     `  messages          : ${fmtInt(off.before.messages)} total, safe touches ${fmtInt(safe.passDelta.touched)}, full touches ${fmtInt(full.passDelta.touched)}`,
+    `  user exclusions   : ${fmtInt(manualOmissions.size + manualTurnOmissions.size)}`,
+    `  persisted savings : ${fmtInt(stats.approxCharsSaved)} chars; tool results dup/norm/append/trunc ${fmtInt(stats.toolResultsDeduped)}/${fmtInt(stats.toolResultsNormalizedDeduped)}/${fmtInt(stats.toolResultsAppendPruned)}/${fmtInt(stats.toolResultsTruncated)}`,
     "",
     "Mode comparison",
     `  off   ${colorBar(off.before.chars, off.before.chars, "off")} ${fmtInt(off.before.chars)} chars  ~${fmtInt(off.before.approxTokens)} tok  0 saved`,
@@ -1737,63 +1739,6 @@ function contextStatText(ctx: any): string {
     ...ruleSummaryLines("Rule hits in safe simulation", safe.passDelta),
     "",
     ...ruleSummaryLines("Rule hits in full simulation", full.passDelta),
-  ].join("\n");
-}
-
-function statusText(ctx?: any): string {
-  const usage = ctx?.getContextUsage?.();
-  const usageLine = usage
-    ? `context: ${usage.tokens ?? "unknown"}/${usage.contextWindow} tokens (${usage.percent?.toFixed(1) ?? "?"}%)`
-    : "context: unknown";
-
-  return [
-    "cprune status",
-    "",
-    "State",
-    `  mode                     : ${mode}`,
-    `  ${usageLine}`,
-    `  seen output hashes       : ${fmtInt(seenOutputs.size)}`,
-    `  user exclusions          : ${fmtInt(manualOmissions.size + manualTurnOmissions.size)}`,
-    `  approx chars saved       : ${fmtInt(stats.approxCharsSaved)}`,
-    "",
-    "Persist-time pruning",
-    `  tool results seen        : ${fmtInt(stats.toolResultsSeen)}`,
-    `  exact duplicates         : ${fmtInt(stats.toolResultsDeduped)}`,
-    `  normalized duplicates    : ${fmtInt(stats.toolResultsNormalizedDeduped)}`,
-    `  append-pruned            : ${fmtInt(stats.toolResultsAppendPruned)}`,
-    `  oversized truncated      : ${fmtInt(stats.toolResultsTruncated)}`,
-    "",
-    "Context-time pruning",
-    `  context passes           : ${fmtInt(stats.contextPasses)}`,
-    `  stale reads              : ${fmtInt(stats.contextStaleReads)}`,
-    `  exact duplicates         : ${fmtInt(stats.contextDuplicates)}`,
-    `  append/contained repeats : ${fmtInt(stats.contextAppendPruned)}`,
-    `  repeated line chunks     : ${fmtInt(stats.contextChunkPruned)}`,
-    `  custom messages pruned   : ${fmtInt(stats.contextCustomMessagesPruned)}`,
-    `  entity snapshots pruned  : ${fmtInt(stats.contextEntityPruned)}`,
-    `  tool-call args pruned    : ${fmtInt(stats.contextToolCallArgsPruned)}`,
-    `  tool calls compacted     : ${fmtInt(stats.contextToolCallsCompacted)}`,
-    `  superseded commands      : ${fmtInt(stats.contextSupersededCommands)}`,
-    `  superseded tool results  : ${fmtInt(stats.contextSupersededToolResults)}`,
-    `  old results truncated    : ${fmtInt(stats.contextTruncations)}`,
-    `  user-excluded entries    : ${fmtInt(stats.manualContextOmissions)}`,
-    `  thinking blocks dropped  : ${fmtInt(stats.thinkingBlocksDropped)}`,
-    `  auto compactions         : ${fmtInt(stats.compactionsTriggered)}`,
-    "",
-    "Savings by rule",
-    `  thinking                  : ${fmtInt(stats.savedThinkingChars)} chars`,
-    `  stale reads               : ${fmtInt(stats.savedStaleReadChars)} chars`,
-    `  duplicates                : ${fmtInt(stats.savedDuplicateChars)} chars`,
-    `  append/contained          : ${fmtInt(stats.savedAppendChars)} chars`,
-    `  superseded commands       : ${fmtInt(stats.savedSupersededCommandChars)} chars`,
-    `  superseded tool results   : ${fmtInt(stats.savedSupersededToolResultChars)} chars`,
-    `  repeated chunks           : ${fmtInt(stats.savedChunkChars)} chars`,
-    `  custom messages           : ${fmtInt(stats.savedCustomChars)} chars`,
-    `  entities                  : ${fmtInt(stats.savedEntityChars)} chars`,
-    `  tool-call args            : ${fmtInt(stats.savedToolCallArgChars)} chars`,
-    `  truncation                : ${fmtInt(stats.savedTruncationChars)} chars`,
-    `  user exclusions           : ${fmtInt(stats.savedManualOmissionChars)} chars`,
-    ...entityFamilyLines(stats.entityFamilyPruned, stats.entityFamilySavedChars),
   ].join("\n");
 }
 
@@ -2157,10 +2102,15 @@ export default function cprune(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cprune", {
-    description: "Control cprune: /cprune off|safe|full|status|stats|review|review-prompts|compact",
+    description: "Control cprune: /cprune [off|safe|full|review|review-prompts|compact]",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
-      const action = parts[0] ?? "status";
+      const action = parts[0];
+
+      if (!action) {
+        ctx.ui.notify(contextStatText(ctx), "info");
+        return;
+      }
 
       if (action === "on" || action === "full") {
         mode = "full";
@@ -2182,17 +2132,7 @@ export default function cprune(pi: ExtensionAPI) {
         mode = "off";
         ctx.ui.setStatus("cprune", "cprune: off");
         saveState(pi);
-        ctx.ui.notify("cprune: pruning disabled. /cprune stats still simulates safe/full savings.", "info");
-        return;
-      }
-
-      if (action === "status") {
-        ctx.ui.notify(statusText(ctx), "info");
-        return;
-      }
-
-      if (action === "stats" || action === "stat" || action === "context-stat") {
-        ctx.ui.notify(contextStatText(ctx), "info");
+        ctx.ui.notify("cprune: pruning disabled. /cprune still simulates safe/full savings.", "info");
         return;
       }
 
@@ -2230,7 +2170,7 @@ export default function cprune(pi: ExtensionAPI) {
         });
         return;
       }
-      ctx.ui.notify("Usage: /cprune [off|safe|full|status|stats|review|review-prompts [safe|full] [N] [page]|clear-exclusions|compact]", "warning");
+      ctx.ui.notify("Usage: /cprune [off|safe|full|review|review-prompts [safe|full] [N] [page]|clear-exclusions|compact]", "warning");
     },
   });
 
@@ -2238,36 +2178,26 @@ export default function cprune(pi: ExtensionAPI) {
     name: "cprune_status",
     label: "cprune status",
     description:
-      "Control cprune and inspect pruning impact. Supports status, stats, off, safe, full, and compact actions.",
-    promptSnippet: "Control cprune and report pruning status/statistics",
+      "Control cprune and inspect pruning impact. Omit action to show the off/safe/full comparison; actions set mode or compact.",
+    promptSnippet: "Control cprune and report pruning impact",
     promptGuidelines: [
-      "Use cprune_status with action=\"stats\" when the user asks whether cprune is saving context or whether pruning is effective.",
+      "Call cprune_status with no action when the user asks whether cprune is saving context or whether pruning is effective.",
       "Use cprune_status with action=\"safe\", action=\"full\", or action=\"off\" when the user asks to set cprune pruning mode.",
       "Use cprune_status with action=\"compact\" when the user asks to persistently compact/prune context via Pi compaction. This is lossy summarization.",
     ],
     parameters: Type.Object({
       action: Type.Optional(
         Type.Union(
-          [
-            Type.Literal("status"),
-            Type.Literal("stats"),
-            Type.Literal("stat"),
-            Type.Literal("context-stat"),
-            Type.Literal("on"),
-            Type.Literal("off"),
-            Type.Literal("safe"),
-            Type.Literal("full"),
-            Type.Literal("compact"),
-          ],
+          [Type.Literal("on"), Type.Literal("off"), Type.Literal("safe"), Type.Literal("full"), Type.Literal("compact")],
           {
             description:
-              "status: cumulative counters; stats: compare off/safe/full context; off/safe/full: set pruning mode (on aliases full); compact: request persistent cprune-focused lossy compaction.",
+              "Omit action to compare off/safe/full context. off/safe/full set pruning mode (on aliases full); compact requests persistent cprune-focused lossy compaction.",
           },
         ),
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const action = params.action ?? "status";
+      const action = params.action;
 
       if (action === "on" || action === "full") {
         mode = "full";
@@ -2288,15 +2218,8 @@ export default function cprune(pi: ExtensionAPI) {
         ctx.ui.setStatus("cprune", "cprune: off");
         saveState(pi);
         return {
-          content: textContent("cprune: pruning disabled. cprune_status action=\"stats\" still simulates safe/full savings."),
+          content: textContent("cprune: pruning disabled. Calling cprune_status without an action still simulates safe/full savings."),
           details: { mode, enabled: mode !== "off", stats },
-        };
-      }
-
-      if (action === "stats" || action === "stat" || action === "context-stat") {
-        return {
-          content: textContent(contextStatText(ctx)),
-          details: { mode, enabled: mode !== "off", stats, seenOutputHashes: seenOutputs.size },
         };
       }
 
@@ -2310,7 +2233,7 @@ export default function cprune(pi: ExtensionAPI) {
         };
       }
 
-      return { content: textContent(statusText(ctx)), details: { mode, enabled: mode !== "off", stats, seenOutputHashes: seenOutputs.size } };
+      return { content: textContent(contextStatText(ctx)), details: { mode, enabled: mode !== "off", stats, seenOutputHashes: seenOutputs.size } };
     },
   });
 }
