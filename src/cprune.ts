@@ -831,17 +831,39 @@ function fmtPct(value: number): string {
   return `${value.toFixed(1)}%`;
 }
 
+const PARTIAL_BLOCKS = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+
+function blockBar(value: number, max: number, width: number): { filled: string; padding: string } {
+  if (max <= 0 || value <= 0) return { filled: "", padding: " ".repeat(width) };
+
+  const scaled = Math.max(0, Math.min(width, (value / max) * width));
+  let full = Math.floor(scaled);
+  let eighth = Math.round((scaled - full) * 8);
+  if (eighth === 8) {
+    full++;
+    eighth = 0;
+  }
+  full = Math.min(full, width);
+  if (full === width) eighth = 0;
+
+  const partial = PARTIAL_BLOCKS[eighth] ?? "";
+  const usedCells = full + (partial ? 1 : 0);
+  return {
+    filled: `${"█".repeat(full)}${partial}`,
+    padding: " ".repeat(Math.max(0, width - usedCells)),
+  };
+}
+
 function bar(value: number, max: number, width = 32): string {
-  if (max <= 0) return "░".repeat(width);
-  const filled = Math.max(0, Math.min(width, Math.round((value / max) * width)));
-  return `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
+  const { filled, padding } = blockBar(value, max, width);
+  return `${filled}${padding}`;
 }
 
 function colorBar(value: number, max: number, kind: "before" | "after", width = 24): string {
-  if (max <= 0) return "·".repeat(width);
-  const filled = Math.max(0, Math.min(width, Math.round((value / max) * width)));
-  const fill = kind === "before" ? "🟧" : "🟩";
-  return `${fill.repeat(filled)}${"·".repeat(width - filled)}`;
+  const { filled, padding } = blockBar(value, max, width);
+  const color = kind === "before" ? "\x1b[38;5;208m" : "\x1b[32m";
+  const reset = "\x1b[0m";
+  return filled ? `${color}${filled}${reset}${padding}` : padding;
 }
 
 function breakdownLines(before: Breakdown, after: Breakdown): string[] {
