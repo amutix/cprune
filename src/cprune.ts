@@ -2074,7 +2074,7 @@ export default function cprune(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cprune", {
-    description: "Control cprune: /cprune on|off|status|stats|review|review-command|compact",
+    description: "Control cprune: /cprune on|off|status|stats|review|review-prompts|compact",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const action = parts[0] ?? "status";
@@ -2110,7 +2110,7 @@ export default function cprune(pi: ExtensionAPI) {
         return;
       }
 
-      if (action === "review-command" || action === "review-turns") {
+      if (action === "review-prompts" || action === "review-command" || action === "review-turns") {
         const limit = Number.isFinite(Number(parts[1])) ? Math.max(1, Math.min(200, Math.floor(Number(parts[1])))) : 10;
         const page = Number.isFinite(Number(parts[2])) ? Math.max(1, Math.floor(Number(parts[2]))) : 1;
         await reviewCommandTurns(ctx, pi, limit, page);
@@ -2134,7 +2134,7 @@ export default function cprune(pi: ExtensionAPI) {
         });
         return;
       }
-      ctx.ui.notify("Usage: /cprune [on|off|status|stats|review|review-command [N]|clear-exclusions|compact]", "warning");
+      ctx.ui.notify("Usage: /cprune [on|off|status|stats|review|review-prompts [N] [page]|clear-exclusions|compact]", "warning");
     },
   });
 
