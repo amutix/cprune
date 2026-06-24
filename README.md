@@ -15,6 +15,10 @@ Entity-aware pruning is generic rather than tied to one extension: it detects ID
 - `/cprune review` and `/cprune review-prompts` let users explicitly exclude large entries or prompt/response turns without rewriting Pi history.
 - `/cprune compact` requests Pi's supported lossy compaction mechanism.
 
+## Screenshot
+
+![cprune off/safe/full context comparison](screenshot.png)
+
 ## Safety and information loss
 
 cprune has two pruning points:
