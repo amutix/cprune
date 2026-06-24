@@ -1,0 +1,19 @@
+{
+  "name": "cprune-pi-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pi extension that prunes duplicate, stale, and oversized context in the background.",
+  "type": "module",
+  "pi": {
+    "extensions": ["src/cprune.ts"]
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "latest",
+    "@types/node": "latest",
+    "typebox": "latest",
+    "typescript": "latest"
+  }
+}

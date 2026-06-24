@@ -1,0 +1,714 @@
+import { createHash } from "node:crypto";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+
+type AnyMessage = any;
+type TextContent = { type: "text"; text: string };
+type ImageContent = { type: "image"; [key: string]: unknown };
+type Content = TextContent | ImageContent | Record<string, unknown>;
+
+type SeenOutput = {
+  hash: string;
+  toolName: string;
+  input: string;
+  firstSeenAt: number;
+  count: number;
+  chars: number;
+};
+
+type CpruneStats = {
+  toolResultsSeen: number;
+  toolResultsDeduped: number;
+  toolResultsAppendPruned: number;
+  toolResultsTruncated: number;
+  contextPasses: number;
+  contextMessagesTouched: number;
+  contextStaleReads: number;
+  contextDuplicates: number;
+  contextAppendPruned: number;
+  contextTruncations: number;
+  thinkingBlocksDropped: number;
+  approxCharsSaved: number;
+  compactionsTriggered: number;
+};
+
+const CUSTOM_TYPE = "cprune:state";
+
+const config = {
+  // Persist-time pruning: affects what gets stored in the session from now on.
+  minDuplicateChars: 1_000,
+  minAppendPrefixChars: 1_000,
+  maxAppendedSuffixChars: 8_000,
+  maxPersistedToolResultChars: 12_000,
+
+  // Send-time pruning: non-destructive; only affects the LLM request context.
+  keepRecentMessagesUntouched: 24,
+  maxContextToolResultChars: 6_000,
+  maxSeenHashes: 300,
+
+  // Background compaction trigger. Set to 0 to disable.
+  autoCompactAtPercent: 82,
+  compactCooldownMs: 10 * 60 * 1_000,
+};
+
+const stats: CpruneStats = {
+  toolResultsSeen: 0,
+  toolResultsDeduped: 0,
+  toolResultsAppendPruned: 0,
+  toolResultsTruncated: 0,
+  contextPasses: 0,
+  contextMessagesTouched: 0,
+  contextStaleReads: 0,
+  contextDuplicates: 0,
+  contextAppendPruned: 0,
+  contextTruncations: 0,
+  thinkingBlocksDropped: 0,
+  approxCharsSaved: 0,
+  compactionsTriggered: 0,
+};
+
+const seenOutputs = new Map<string, SeenOutput>();
+let lastCompactAt = 0;
+let compactInFlight = false;
+let enabled = true;
+
+function hashText(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+function shortHash(hash: string): string {
+  return hash.slice(0, 16);
+}
+
+function safeJson(value: unknown, max = 220): string {
+  let text: string;
+  try {
+    text = JSON.stringify(value);
+  } catch {
+    text = String(value);
+  }
+  if (!text) return "{}";
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+function textFromContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block): block is TextContent => block && block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text)
+    .join("\n");
+}
+
+function textContent(text: string): TextContent[] {
+  return [{ type: "text", text }];
+}
+
+function truncateMiddle(text: string, maxChars: number, label: string): { text: string; saved: number } {
+  if (text.length <= maxChars) return { text, saved: 0 };
+
+  const marker = `\n\n[cprune: omitted ${text.length - maxChars} chars from ${label}]\n\n`;
+  const room = Math.max(0, maxChars - marker.length);
+  const head = Math.ceil(room * 0.65);
+  const tail = Math.max(0, room - head);
+  return {
+    text: `${text.slice(0, head)}${marker}${tail > 0 ? text.slice(-tail) : ""}`,
+    saved: text.length - maxChars,
+  };
+}
+
+function mergeStats(saved: number) {
+  if (saved > 0) stats.approxCharsSaved += saved;
+}
+
+function rememberOutput(hash: string, toolName: string, input: unknown, chars: number): SeenOutput | undefined {
+  const existing = seenOutputs.get(hash);
+  if (existing) {
+    existing.count++;
+    return existing;
+  }
+
+  seenOutputs.set(hash, {
+    hash,
+    toolName,
+    input: safeJson(input),
+    firstSeenAt: Date.now(),
+    count: 1,
+    chars,
+  });
+
+  while (seenOutputs.size > config.maxSeenHashes) {
+    const oldest = seenOutputs.keys().next().value;
+    if (!oldest) break;
+    seenOutputs.delete(oldest);
+  }
+
+  return undefined;
+}
+
+function findAppendedSeenOutput(text: string, toolName: string): SeenOutput | undefined {
+  // Detect "same output with new info appended" without storing the old full text:
+  // if sha256(newText.slice(0, oldLength)) === oldFullHash, the old output is an exact prefix.
+  const candidates = [...seenOutputs.values()]
+    .filter(
+      (seen) =>
+        seen.toolName === toolName &&
+        seen.chars >= config.minAppendPrefixChars &&
+        seen.chars < text.length,
+    )
+    .sort((a, b) => b.chars - a.chars);
+
+  for (const seen of candidates) {
+    if (hashText(text.slice(0, seen.chars)) === seen.hash) return seen;
+  }
+
+  return undefined;
+}
+
+function appendedReplacement(
+  text: string,
+  toolName: string,
+  prior: Pick<SeenOutput, "hash" | "chars" | "input"> & { index?: number },
+): { text: string; saved: number } {
+  const suffix = text.slice(prior.chars);
+  const suffixTrimmed = truncateMiddle(suffix, config.maxAppendedSuffixChars, `newly appended ${toolName} output`);
+  const header =
+    prior.index === undefined
+      ? `[cprune: omitted ${prior.chars} repeated prefix chars from ${toolName} result; prefix hash=${shortHash(prior.hash)}; first input=${prior.input}. Newly appended output follows.]\n`
+      : `[cprune: omitted ${prior.chars} repeated prefix chars from ${toolName} result; same prefix appeared at message index ${prior.index}; prefix hash=${shortHash(prior.hash)}. Newly appended output follows.]\n`;
+
+  return {
+    text: `${header}${suffixTrimmed.text}`,
+    saved: Math.max(0, prior.chars - header.length) + suffixTrimmed.saved,
+  };
+}
+
+function loadStateFromSession(ctx: any) {
+  const entries = ctx.sessionManager.getEntries?.() ?? [];
+  const stateEntry = [...entries]
+    .reverse()
+    .find((entry: any) => entry.type === "custom" && entry.customType === CUSTOM_TYPE && entry.data);
+
+  if (!stateEntry?.data) return;
+
+  Object.assign(stats, stateEntry.data.stats ?? {});
+  lastCompactAt = stateEntry.data.lastCompactAt ?? 0;
+  enabled = stateEntry.data.enabled ?? true;
+
+  if (Array.isArray(stateEntry.data.seenOutputs)) {
+    seenOutputs.clear();
+    for (const item of stateEntry.data.seenOutputs.slice(-config.maxSeenHashes)) {
+      if (item?.hash) seenOutputs.set(item.hash, item);
+    }
+  }
+}
+
+function saveState(pi: ExtensionAPI) {
+  pi.appendEntry(CUSTOM_TYPE, {
+    stats,
+    enabled,
+    lastCompactAt,
+    seenOutputs: [...seenOutputs.values()].slice(-config.maxSeenHashes),
+    savedAt: Date.now(),
+  });
+}
+
+function getAssistantToolCalls(messages: AnyMessage[]) {
+  const calls = new Map<string, { name: string; args: Record<string, unknown>; messageIndex: number }>();
+
+  messages.forEach((message, messageIndex) => {
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
+    for (const block of message.content) {
+      if (block?.type === "toolCall" && typeof block.id === "string") {
+        calls.set(block.id, {
+          name: String(block.name ?? ""),
+          args: (block.arguments ?? {}) as Record<string, unknown>,
+          messageIndex,
+        });
+      }
+    }
+  });
+
+  return calls;
+}
+
+function normalizePath(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  return value.replace(/\\/g, "/");
+}
+
+function cloneWithText(message: AnyMessage, text: string): AnyMessage {
+  return {
+    ...message,
+    content: textContent(text),
+  };
+}
+
+function pruneAssistantThinking(message: AnyMessage): { message: AnyMessage; saved: number; dropped: number } {
+  if (message?.role !== "assistant" || !Array.isArray(message.content)) {
+    return { message, saved: 0, dropped: 0 };
+  }
+
+  let saved = 0;
+  let dropped = 0;
+  const kept: Content[] = [];
+
+  for (const block of message.content) {
+    if (block?.type === "thinking" && typeof block.thinking === "string") {
+      saved += block.thinking.length;
+      dropped++;
+      continue;
+    }
+    kept.push(block);
+  }
+
+  if (dropped === 0) return { message, saved: 0, dropped: 0 };
+
+  return {
+    message: {
+      ...message,
+      content: kept.length > 0 ? kept : textContent("[cprune: old assistant reasoning omitted]"),
+    },
+    saved,
+    dropped,
+  };
+}
+
+function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
+  stats.contextPasses++;
+
+  const calls = getAssistantToolCalls(messages);
+  const recentStart = Math.max(0, messages.length - config.keepRecentMessagesUntouched);
+  const latestReadByPath = new Map<string, number>();
+  const latestMutationByPath = new Map<string, number>();
+
+  messages.forEach((message, index) => {
+    if (message?.role === "toolResult") {
+      const call = calls.get(message.toolCallId);
+      if (call?.name === "read") {
+        const path = normalizePath(call.args.path);
+        if (path && !message.isError) latestReadByPath.set(path, index);
+      }
+    }
+
+    if (message?.role === "assistant" && Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block?.type !== "toolCall") continue;
+        const toolName = String(block.name ?? "");
+        if (toolName !== "edit" && toolName !== "write") continue;
+        const path = normalizePath(block.arguments?.path);
+        if (path) latestMutationByPath.set(path, index);
+      }
+    }
+  });
+
+  const contextFingerprints: Array<{ hash: string; index: number; toolName: string; chars: number }> = [];
+  let touched = 0;
+
+  return messages.map((message, index) => {
+    // Keep the very recent tail pristine so active tool-use protocol stays high fidelity.
+    if (index >= recentStart) return message;
+
+    let current = message;
+
+    const thinking = pruneAssistantThinking(current);
+    if (thinking.dropped > 0) {
+      current = thinking.message;
+      stats.thinkingBlocksDropped += thinking.dropped;
+      mergeStats(thinking.saved);
+      touched++;
+    }
+
+    if (current?.role !== "toolResult") return current;
+
+    const call = calls.get(current.toolCallId);
+    const toolName = call?.name ?? current.toolName ?? "tool";
+    const fullText = textFromContent(current.content);
+    if (!fullText) return current;
+
+    // Stale file reads: an older read is superseded by a newer read of the same file
+    // or by a later edit/write call to that file.
+    if (toolName === "read") {
+      const path = normalizePath(call?.args.path);
+      if (path) {
+        const newerRead = latestReadByPath.get(path);
+        const laterMutation = latestMutationByPath.get(path);
+        if ((newerRead !== undefined && newerRead > index) || (laterMutation !== undefined && laterMutation > index)) {
+          const reason = newerRead !== undefined && newerRead > index ? "newer read exists" : "later edit/write exists";
+          stats.contextStaleReads++;
+          touched++;
+          mergeStats(Math.max(0, fullText.length - 120));
+          return cloneWithText(
+            current,
+            `[cprune: stale read result omitted for ${path}; ${reason}. Re-read the file if exact old contents are needed.]`,
+          );
+        }
+      }
+    }
+
+    // Duplicate or append-only tool outputs in the request context.
+    if (fullText.length >= config.minDuplicateChars) {
+      const hash = hashText(fullText);
+      const exact = contextFingerprints.find((fp) => fp.hash === hash);
+      if (exact) {
+        stats.contextDuplicates++;
+        touched++;
+        mergeStats(Math.max(0, fullText.length - 160));
+        return cloneWithText(
+          current,
+          `[cprune: duplicate ${toolName} result omitted; same output appeared earlier at message index ${exact.index}; hash=${shortHash(hash)}.]`,
+        );
+      }
+
+      const appended = contextFingerprints
+        .filter(
+          (fp) =>
+            fp.toolName === toolName &&
+            fp.chars >= config.minAppendPrefixChars &&
+            fp.chars < fullText.length,
+        )
+        .sort((a, b) => b.chars - a.chars)
+        .find((fp) => hashText(fullText.slice(0, fp.chars)) === fp.hash);
+
+      if (appended) {
+        const replacement = appendedReplacement(fullText, toolName, {
+          hash: appended.hash,
+          chars: appended.chars,
+          input: "context",
+          index: appended.index,
+        });
+        stats.contextAppendPruned++;
+        touched++;
+        mergeStats(replacement.saved);
+        contextFingerprints.push({ hash, index, toolName, chars: fullText.length });
+        return cloneWithText(current, replacement.text);
+      }
+
+      contextFingerprints.push({ hash, index, toolName, chars: fullText.length });
+    }
+
+    // Oversized old tool outputs.
+    const limit = toolName === "bash" ? config.maxContextToolResultChars + 2_000 : config.maxContextToolResultChars;
+    const truncated = truncateMiddle(fullText, limit, `${toolName} result in request context`);
+    if (truncated.saved > 0) {
+      stats.contextTruncations++;
+      touched++;
+      mergeStats(truncated.saved);
+      return cloneWithText(current, truncated.text);
+    }
+
+    return current;
+  }).map((message) => {
+    // Update once per pass without doing another traversal.
+    return message;
+  }).filter((message, _index, all) => {
+    if (_index === all.length - 1) stats.contextMessagesTouched += touched;
+    return true;
+  });
+}
+
+function cloneStats(): CpruneStats {
+  return { ...stats };
+}
+
+function restoreStats(snapshot: CpruneStats) {
+  Object.assign(stats, snapshot);
+}
+
+function roughMessageChars(message: AnyMessage): number {
+  if (!message) return 0;
+
+  if (message.role === "user" || message.role === "toolResult" || message.role === "custom") {
+    return textFromContent(message.content).length || safeJson(message).length;
+  }
+
+  if (message.role === "assistant" && Array.isArray(message.content)) {
+    return message.content
+      .map((block: any) => {
+        if (block?.type === "text") return block.text?.length ?? 0;
+        if (block?.type === "thinking") return block.thinking?.length ?? 0;
+        if (block?.type === "toolCall") return safeJson(block, 10_000).length;
+        return safeJson(block, 10_000).length;
+      })
+      .reduce((sum: number, n: number) => sum + n, 0);
+  }
+
+  if (message.role === "compactionSummary") return String(message.summary ?? "").length;
+  if (message.role === "branchSummary") return String(message.summary ?? "").length;
+  if (message.role === "bashExecution") return String(message.command ?? "").length + String(message.output ?? "").length;
+
+  return safeJson(message, 50_000).length;
+}
+
+function contextSize(messages: AnyMessage[]) {
+  const chars = messages.reduce((sum, message) => sum + roughMessageChars(message), 0);
+  return {
+    messages: messages.length,
+    chars,
+    approxTokens: Math.ceil(chars / 4),
+  };
+}
+
+function currentContextMessages(ctx: any): AnyMessage[] {
+  const built = ctx.sessionManager?.buildSessionContext?.();
+  if (Array.isArray(built?.messages)) return built.messages;
+
+  // Fallback for older SDK shapes. This is less exact because it does not convert
+  // compaction/custom entries, but keeps /cprune context-stat useful.
+  const branch = ctx.sessionManager?.getBranch?.() ?? [];
+  return branch
+    .map((entry: any) => {
+      if (entry.type === "message") return entry.message;
+      if (entry.type === "custom_message") {
+        return { role: "custom", customType: entry.customType, content: entry.content, display: entry.display, details: entry.details };
+      }
+      if (entry.type === "compaction") return { role: "compactionSummary", summary: entry.summary };
+      if (entry.type === "branch_summary") return { role: "branchSummary", summary: entry.summary };
+      return undefined;
+    })
+    .filter(Boolean);
+}
+
+function contextStatText(ctx: any): string {
+  const rawMessages = currentContextMessages(ctx);
+  const before = contextSize(rawMessages);
+
+  const snapshot = cloneStats();
+  const prunedMessages = pruneContextMessages(rawMessages);
+  const passDelta = {
+    staleReads: stats.contextStaleReads - snapshot.contextStaleReads,
+    duplicates: stats.contextDuplicates - snapshot.contextDuplicates,
+    appendPruned: stats.contextAppendPruned - snapshot.contextAppendPruned,
+    truncations: stats.contextTruncations - snapshot.contextTruncations,
+    thinkingBlocks: stats.thinkingBlocksDropped - snapshot.thinkingBlocksDropped,
+    touched: stats.contextMessagesTouched - snapshot.contextMessagesTouched,
+    saved: stats.approxCharsSaved - snapshot.approxCharsSaved,
+  };
+  restoreStats(snapshot);
+
+  const after = contextSize(prunedMessages);
+  const savedChars = Math.max(0, before.chars - after.chars);
+  const savedPct = before.chars > 0 ? (savedChars / before.chars) * 100 : 0;
+  const usage = ctx.getContextUsage?.();
+  const modelUsage = usage
+    ? `${usage.tokens ?? "unknown"}/${usage.contextWindow} tokens (${usage.percent?.toFixed(1) ?? "?"}%)`
+    : "unknown";
+
+  return [
+    "cprune context-stat",
+    `pruning currently: ${enabled ? "on" : "off"}`,
+    `model-reported context: ${modelUsage}`,
+    `raw context: ${before.messages} messages, ${before.chars.toLocaleString()} chars, ~${before.approxTokens.toLocaleString()} tokens`,
+    `with cprune: ${after.messages} messages, ${after.chars.toLocaleString()} chars, ~${after.approxTokens.toLocaleString()} tokens`,
+    `estimated savings if on: ${savedChars.toLocaleString()} chars (~${Math.ceil(savedChars / 4).toLocaleString()} tokens, ${savedPct.toFixed(1)}%)`,
+    `messages touched: ${passDelta.touched}`,
+    `stale reads: ${passDelta.staleReads}`,
+    `exact duplicates: ${passDelta.duplicates}`,
+    `append-only repeats: ${passDelta.appendPruned}`,
+    `oversized old results truncated: ${passDelta.truncations}`,
+    `old thinking blocks dropped: ${passDelta.thinkingBlocks}`,
+    `pass-estimated saved chars by rules: ${passDelta.saved.toLocaleString()}`,
+  ].join("\n");
+}
+
+function statusText(ctx?: any): string {
+  const usage = ctx?.getContextUsage?.();
+  const usageLine = usage
+    ? `context: ${usage.tokens ?? "unknown"}/${usage.contextWindow} tokens (${usage.percent?.toFixed(1) ?? "?"}%)`
+    : "context: unknown";
+
+  return [
+    "cprune status",
+    `pruning: ${enabled ? "on" : "off"}`,
+    usageLine,
+    `seen output hashes: ${seenOutputs.size}`,
+    `tool results seen: ${stats.toolResultsSeen}`,
+    `persist-time deduped: ${stats.toolResultsDeduped}`,
+    `persist-time append-pruned: ${stats.toolResultsAppendPruned}`,
+    `persist-time truncated: ${stats.toolResultsTruncated}`,
+    `context passes: ${stats.contextPasses}`,
+    `context stale reads pruned: ${stats.contextStaleReads}`,
+    `context duplicate results pruned: ${stats.contextDuplicates}`,
+    `context append-pruned results: ${stats.contextAppendPruned}`,
+    `context old tool results truncated: ${stats.contextTruncations}`,
+    `assistant thinking blocks dropped from old context: ${stats.thinkingBlocksDropped}`,
+    `auto compactions triggered: ${stats.compactionsTriggered}`,
+    `approx chars saved: ${stats.approxCharsSaved.toLocaleString()}`,
+  ].join("\n");
+}
+
+function maybeTriggerCompaction(ctx: any) {
+  if (!enabled || !config.autoCompactAtPercent || compactInFlight) return;
+
+  const usage = ctx.getContextUsage?.();
+  if (!usage?.percent || usage.percent < config.autoCompactAtPercent) return;
+
+  const now = Date.now();
+  if (now - lastCompactAt < config.compactCooldownMs) return;
+
+  compactInFlight = true;
+  lastCompactAt = now;
+  stats.compactionsTriggered++;
+
+  ctx.compact({
+    customInstructions:
+      "cprune is active. Produce a compact continuation summary that removes duplicated tool outputs, ignores stale file-read snapshots when newer reads or edits exist, and preserves only the current goal, constraints, decisions, modified/read files, blockers, and next steps.",
+    onComplete: () => {
+      compactInFlight = false;
+      ctx.ui.notify("cprune: background compaction completed", "info");
+    },
+    onError: (error: Error) => {
+      compactInFlight = false;
+      ctx.ui.notify(`cprune: background compaction failed: ${error.message}`, "warning");
+    },
+  });
+}
+
+export default function cprune(pi: ExtensionAPI) {
+  pi.on("session_start", (_event, ctx) => {
+    loadStateFromSession(ctx);
+    ctx.ui.setStatus("cprune", `cprune: ${enabled ? "on" : "off"}`);
+  });
+
+  pi.on("session_shutdown", () => {
+    saveState(pi);
+  });
+
+  pi.on("tool_result", (event) => {
+    if (!enabled) return;
+
+    stats.toolResultsSeen++;
+
+    const fullText = textFromContent(event.content);
+    if (!fullText) return;
+
+    if (fullText.length >= config.minDuplicateChars) {
+      const hash = hashText(fullText);
+      const duplicate = seenOutputs.get(hash);
+      if (duplicate) {
+        duplicate.count++;
+        stats.toolResultsDeduped++;
+        const replacement = `[cprune: duplicate ${event.toolName} result omitted. First seen for ${duplicate.toolName}(${duplicate.input}); hash=${shortHash(hash)}; original length=${fullText.length} chars.]`;
+        mergeStats(Math.max(0, fullText.length - replacement.length));
+        return {
+          content: textContent(replacement),
+          details: {
+            ...(typeof event.details === "object" && event.details ? event.details : {}),
+            cprune: { pruned: "duplicate", hash, originalChars: fullText.length },
+          },
+        };
+      }
+
+      const appended = findAppendedSeenOutput(fullText, event.toolName);
+      rememberOutput(hash, event.toolName, event.input, fullText.length);
+      if (appended) {
+        stats.toolResultsAppendPruned++;
+        const replacement = appendedReplacement(fullText, event.toolName, appended);
+        mergeStats(replacement.saved);
+        return {
+          content: textContent(replacement.text),
+          details: {
+            ...(typeof event.details === "object" && event.details ? event.details : {}),
+            cprune: {
+              pruned: "appended",
+              prefixHash: appended.hash,
+              omittedPrefixChars: appended.chars,
+              originalChars: fullText.length,
+            },
+          },
+        };
+      }
+    }
+
+    const limit = event.toolName === "bash" ? config.maxPersistedToolResultChars + 4_000 : config.maxPersistedToolResultChars;
+    const truncated = truncateMiddle(fullText, limit, `${event.toolName} result before persistence`);
+    if (truncated.saved > 0) {
+      stats.toolResultsTruncated++;
+      mergeStats(truncated.saved);
+      return {
+        content: textContent(truncated.text),
+        details: {
+          ...(typeof event.details === "object" && event.details ? event.details : {}),
+          cprune: { pruned: "truncated", originalChars: fullText.length, keptChars: truncated.text.length },
+        },
+      };
+    }
+  });
+
+  pi.on("context", (event) => {
+    if (!enabled) return;
+    return { messages: pruneContextMessages(event.messages) };
+  });
+
+  pi.on("agent_end", (_event, ctx) => {
+    maybeTriggerCompaction(ctx);
+  });
+
+  pi.registerCommand("cprune", {
+    description: "Control cprune: /cprune on|off|status|context-stat|compact",
+    handler: async (args, ctx) => {
+      const action = args.trim() || "status";
+
+      if (action === "on") {
+        enabled = true;
+        ctx.ui.setStatus("cprune", "cprune: on");
+        saveState(pi);
+        ctx.ui.notify("cprune: pruning enabled", "info");
+        return;
+      }
+
+      if (action === "off") {
+        enabled = false;
+        ctx.ui.setStatus("cprune", "cprune: off");
+        saveState(pi);
+        ctx.ui.notify("cprune: pruning disabled. /cprune context-stat still simulates potential savings.", "info");
+        return;
+      }
+
+      if (action === "status") {
+        ctx.ui.notify(statusText(ctx), "info");
+        return;
+      }
+
+      if (action === "context-stat") {
+        ctx.ui.notify(contextStatText(ctx), "info");
+        return;
+      }
+
+      if (action === "compact") {
+        ctx.compact({
+          customInstructions:
+            "cprune manual compaction: deduplicate repeated outputs, discard stale file snapshots superseded by newer reads/edits, and keep current goal, decisions, modified files, blockers, and next steps.",
+          onComplete: () => ctx.ui.notify("cprune: compaction completed", "info"),
+          onError: (error) => ctx.ui.notify(`cprune: compaction failed: ${error.message}`, "warning"),
+        });
+        return;
+      }
+      ctx.ui.notify("Usage: /cprune [on|off|status|context-stat|compact]", "warning");
+    },
+  });
+
+  pi.registerTool({
+    name: "cprune_status",
+    label: "cprune status",
+    description: "Report context-pruning statistics and optionally trigger a cprune-focused compaction.",
+    promptSnippet: "Report cprune context-pruning statistics or trigger focused compaction",
+    parameters: Type.Object({
+      action: Type.Optional(
+        Type.Union([Type.Literal("status"), Type.Literal("compact")], {
+          description: "Use status to inspect pruning, compact to request cprune-focused compaction.",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (params.action === "compact") {
+        ctx.compact({
+          customInstructions:
+            "cprune tool-triggered compaction: remove duplicate/stale details and preserve only actionable continuation state.",
+        });
+        return { content: textContent("cprune: compaction requested"), details: { stats } };
+      }
+      return { content: textContent(statusText(ctx)), details: { stats, seenOutputHashes: seenOutputs.size } };
+    },
+  });
+}
