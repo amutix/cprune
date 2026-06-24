@@ -4,7 +4,7 @@ Context pruning extension for Pi. It reduces duplicate, append-only, stale, and 
 
 Append/contained pruning detects exact byte prefixes, normalized line-prefixes, substantial normalized contained blocks, and repeated line chunks, so it can catch repeated output with new lines appended even when ANSI escapes, CRLF/LF, trailing whitespace, small wrappers, or some middle insertions differ. Older repeated read-only snapshot commands such as `rg`, `find`, `ls`, and `git status` are also pruned when the same command is run again later. Old custom extension messages are deduped/truncated generically without hardcoding any extension names.
 
-Entity-aware pruning is generic rather than tied to one extension: it detects IDs like `TASK-123`, `SPEC-12`, `DISC-3`, `ISSUE-9`, `PR-42`, etc., then compacts older duplicate/superseded snapshots while preserving IDs, hashes, and short previews. Old successful assistant tool calls also have oversized string arguments replaced with hash+preview placeholders so large prior spec/comment bodies do not remain in request context.
+Entity-aware pruning is generic rather than tied to one extension: it detects IDs like `TASK-123`, `SPEC-12`, `DISC-3`, `ISSUE-9`, `PR-42`, etc., then applies a latest-entity-snapshot-wins policy across older user messages, custom extension messages, tool results, assistant text, and summaries while preserving IDs, hashes, and short previews. Old successful assistant tool calls also have oversized string arguments replaced with hash+preview placeholders so large prior spec/comment bodies do not remain in request context. Stats include entity-family counts/savings such as `TASK-*`, `SPEC-*`, and `DISC-*`.
 
 ## Use
 

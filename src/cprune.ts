@@ -56,6 +56,8 @@ type CpruneStats = {
   savedEntityChars: number;
   savedToolCallArgChars: number;
   savedTruncationChars: number;
+  entityFamilyPruned: Record<string, number>;
+  entityFamilySavedChars: Record<string, number>;
   compactionsTriggered: number;
 };
 
@@ -72,9 +74,10 @@ const config = {
   keepRecentMessagesUntouched: 24,
   maxContextToolResultChars: 6_000,
   maxContextCustomMessageChars: 4_000,
-  maxEntityPreviewChars: 1_200,
-  minEntityPruneChars: 1_800,
-  maxToolCallArgStringChars: 1_200,
+  maxEntityPreviewChars: 900,
+  minEntityPruneChars: 700,
+  maxToolCallArgStringChars: 800,
+  maxPriorityToolCallArgStringChars: 300,
   minRepeatedChunkLines: 24,
   minRepeatedChunkChars: 1_200,
   maxSeenHashes: 300,
@@ -112,6 +115,8 @@ const stats: CpruneStats = {
   savedEntityChars: 0,
   savedToolCallArgChars: 0,
   savedTruncationChars: 0,
+  entityFamilyPruned: {},
+  entityFamilySavedChars: {},
   compactionsTriggered: 0,
 };
 
@@ -228,6 +233,20 @@ type EntitySeen = { index: number; hash: string; ids: string[]; chars: number };
 
 function extractEntityIds(text: string): string[] {
   return [...new Set([...text.matchAll(ENTITY_ID_RE)].map((match) => match[0].toUpperCase()))];
+}
+
+function entityFamily(id: string): string {
+  const prefix = id.split("-")[0]?.toUpperCase() || "ENTITY";
+  return `${prefix}-*`;
+}
+
+function recordEntityFamilySavings(ids: string[], saved: number) {
+  if (saved <= 0 || ids.length === 0) return;
+  const families = [...new Set(ids.map(entityFamily))];
+  for (const family of families) {
+    stats.entityFamilyPruned[family] = (stats.entityFamilyPruned[family] ?? 0) + 1;
+    stats.entityFamilySavedChars[family] = (stats.entityFamilySavedChars[family] ?? 0) + saved;
+  }
 }
 
 function normalizeEntityText(text: string): string {
@@ -452,6 +471,8 @@ function loadStateFromSession(ctx: any) {
   if (!stateEntry?.data) return;
 
   Object.assign(stats, stateEntry.data.stats ?? {});
+  stats.entityFamilyPruned = { ...(stateEntry.data.stats?.entityFamilyPruned ?? {}) };
+  stats.entityFamilySavedChars = { ...(stateEntry.data.stats?.entityFamilySavedChars ?? {}) };
   lastCompactAt = stateEntry.data.lastCompactAt ?? 0;
   enabled = stateEntry.data.enabled ?? true;
 
@@ -536,9 +557,13 @@ function pruneAssistantThinking(message: AnyMessage): { message: AnyMessage; sav
 
 function pruneArgValue(value: unknown, path: string): { value: unknown; saved: number; pruned: number } {
   if (typeof value === "string") {
-    if (value.length <= config.maxToolCallArgStringChars) return { value, saved: 0, pruned: 0 };
-    const preview = value.slice(0, 220).replace(/\s+/g, " ").trim();
-    const replacement = `[cprune: omitted prior tool-call argument ${path}; ${value.length} chars; hash=${shortHash(hashText(value))}; preview=${JSON.stringify(preview)}]`;
+    const key = path.split(/[.[\]]/).filter(Boolean).at(-1)?.toLowerCase() ?? path.toLowerCase();
+    const priority = /^(content|summary|description|message|body|text|oldtext|newtext|spec|plan|comment|details|instructions)$/i.test(key);
+    const limit = priority ? config.maxPriorityToolCallArgStringChars : config.maxToolCallArgStringChars;
+    if (value.length <= limit) return { value, saved: 0, pruned: 0 };
+    const ids = extractEntityIds(value);
+    const preview = value.slice(0, Math.min(260, limit)).replace(/\s+/g, " ").trim();
+    const replacement = `[cprune: omitted prior tool-call argument ${path}; ${value.length} chars; hash=${shortHash(hashText(value))}${ids.length ? `; entities=${ids.join(",")}` : ""}; preview=${JSON.stringify(preview)}]`;
     return { value: replacement, saved: Math.max(0, value.length - replacement.length), pruned: 1 };
   }
 
@@ -602,6 +627,7 @@ function pruneAssistantContext(
       if (pruned.pruned) {
         saved += pruned.saved;
         savedEntity += pruned.saved;
+        recordEntityFamilySavings(extractEntityIds(block.text), pruned.saved);
         touched = true;
         entityPruned++;
         return { ...block, text: pruned.text };
@@ -770,7 +796,22 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
         stats.contextEntityPruned++;
         touched++;
         recordSavings(entityPruned.saved, "savedEntityChars");
+        recordEntityFamilySavings(extractEntityIds(fullText), entityPruned.saved);
         return { ...current, summary: entityPruned.text };
+      }
+      return current;
+    }
+
+    if (current?.role === "user") {
+      const fullText = textFromContent(current.content);
+      if (!fullText) return current;
+      const entityPruned = pruneEntityText(fullText, "user message", index, latestEntityIndex, seenEntities);
+      if (entityPruned.pruned) {
+        stats.contextEntityPruned++;
+        touched++;
+        recordSavings(entityPruned.saved, "savedEntityChars");
+        recordEntityFamilySavings(extractEntityIds(fullText), entityPruned.saved);
+        return cloneWithText(current, entityPruned.text);
       }
       return current;
     }
@@ -786,6 +827,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
         stats.contextCustomMessagesPruned++;
         touched++;
         recordSavings(entityPruned.saved, "savedEntityChars");
+        recordEntityFamilySavings(extractEntityIds(fullText), entityPruned.saved);
         return cloneWithText(current, entityPruned.text);
       }
 
@@ -850,6 +892,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
       stats.contextEntityPruned++;
       touched++;
       recordSavings(entityPruned.saved, "savedEntityChars");
+      recordEntityFamilySavings(extractEntityIds(fullText), entityPruned.saved);
       return cloneWithText(current, entityPruned.text);
     }
 
@@ -949,11 +992,26 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
 }
 
 function cloneStats(): CpruneStats {
-  return { ...stats };
+  return {
+    ...stats,
+    entityFamilyPruned: { ...stats.entityFamilyPruned },
+    entityFamilySavedChars: { ...stats.entityFamilySavedChars },
+  };
 }
 
 function restoreStats(snapshot: CpruneStats) {
   Object.assign(stats, snapshot);
+  stats.entityFamilyPruned = { ...snapshot.entityFamilyPruned };
+  stats.entityFamilySavedChars = { ...snapshot.entityFamilySavedChars };
+}
+
+function diffRecord(after: Record<string, number>, before: Record<string, number>): Record<string, number> {
+  const result: Record<string, number> = {};
+  for (const key of new Set([...Object.keys(after), ...Object.keys(before)])) {
+    const delta = (after[key] ?? 0) - (before[key] ?? 0);
+    if (delta !== 0) result[key] = delta;
+  }
+  return result;
 }
 
 function roughMessageChars(message: AnyMessage): number {
@@ -1143,6 +1201,23 @@ function countBar(label: string, value: number, max: number): string {
   return `${padded} ${bar(value, max, 18)} ${fmtInt(value)}`;
 }
 
+function entityFamilyLines(counts: Record<string, number>, saved: Record<string, number>): string[] {
+  const families = [...new Set([...Object.keys(counts), ...Object.keys(saved)])]
+    .filter((family) => (counts[family] ?? 0) > 0 || (saved[family] ?? 0) > 0)
+    .sort();
+  if (families.length === 0) return [];
+
+  const maxSaved = Math.max(1, ...families.map((family) => saved[family] ?? 0));
+  return [
+    "",
+    "Entity family pruning",
+    ...families.map(
+      (family) =>
+        `  ${family.padEnd(10)} ${bar(saved[family] ?? 0, maxSaved, 18)} ${fmtInt(counts[family] ?? 0)} snapshots, ${fmtInt(saved[family] ?? 0)} chars`,
+    ),
+  ];
+}
+
 function simulatePrunedContext(ctx: any) {
   const rawMessages = currentContextMessages(ctx);
   const before = contextSize(rawMessages);
@@ -1172,6 +1247,8 @@ function simulatePrunedContext(ctx: any) {
     savedEntities: stats.savedEntityChars - snapshot.savedEntityChars,
     savedToolCallArgs: stats.savedToolCallArgChars - snapshot.savedToolCallArgChars,
     savedTruncations: stats.savedTruncationChars - snapshot.savedTruncationChars,
+    entityFamilyPruned: diffRecord(stats.entityFamilyPruned, snapshot.entityFamilyPruned),
+    entityFamilySavedChars: diffRecord(stats.entityFamilySavedChars, snapshot.entityFamilySavedChars),
   };
   restoreStats(snapshot);
 
@@ -1236,6 +1313,7 @@ function contextStatText(ctx: any): string {
     `  ${countBar("superseded snapshot commands", passDelta.supersededCommands, maxRuleCount)}`,
     `  ${countBar("oversized old results", passDelta.truncations, maxRuleCount)}`,
     `  ${countBar("exact duplicates", passDelta.duplicates, maxRuleCount)}`,
+    ...entityFamilyLines(passDelta.entityFamilyPruned, passDelta.entityFamilySavedChars),
     "",
     "Savings by rule",
     `  ${countBar("thinking chars", passDelta.savedThinking, Math.max(1, passDelta.saved))}`,
@@ -1299,6 +1377,7 @@ function statusText(ctx?: any): string {
     `  entities                  : ${fmtInt(stats.savedEntityChars)} chars`,
     `  tool-call args            : ${fmtInt(stats.savedToolCallArgChars)} chars`,
     `  truncation                : ${fmtInt(stats.savedTruncationChars)} chars`,
+    ...entityFamilyLines(stats.entityFamilyPruned, stats.entityFamilySavedChars),
   ].join("\n");
 }
 
