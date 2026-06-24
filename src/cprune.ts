@@ -856,24 +856,66 @@ export default function cprune(pi: ExtensionAPI) {
   pi.registerTool({
     name: "cprune_status",
     label: "cprune status",
-    description: "Report context-pruning statistics and optionally trigger a cprune-focused compaction.",
-    promptSnippet: "Report cprune context-pruning statistics or trigger focused compaction",
+    description:
+      "Control cprune and inspect pruning impact. Supports status, context-stat, on, off, and compact actions.",
+    promptSnippet: "Control cprune and report pruning status/context-statistics",
+    promptGuidelines: [
+      "Use cprune_status with action=\"context-stat\" when the user asks whether cprune is saving context or whether pruning is effective.",
+      "Use cprune_status with action=\"on\" or action=\"off\" when the user asks to enable or disable cprune pruning.",
+    ],
     parameters: Type.Object({
       action: Type.Optional(
-        Type.Union([Type.Literal("status"), Type.Literal("compact")], {
-          description: "Use status to inspect pruning, compact to request cprune-focused compaction.",
-        }),
+        Type.Union(
+          [
+            Type.Literal("status"),
+            Type.Literal("context-stat"),
+            Type.Literal("on"),
+            Type.Literal("off"),
+            Type.Literal("compact"),
+          ],
+          {
+            description:
+              "status: cumulative counters; context-stat: simulate raw vs pruned context; on/off: enable or disable pruning; compact: request focused compaction.",
+          },
+        ),
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (params.action === "compact") {
+      const action = params.action ?? "status";
+
+      if (action === "on") {
+        enabled = true;
+        ctx.ui.setStatus("cprune", "cprune: on");
+        saveState(pi);
+        return { content: textContent("cprune: pruning enabled"), details: { enabled, stats } };
+      }
+
+      if (action === "off") {
+        enabled = false;
+        ctx.ui.setStatus("cprune", "cprune: off");
+        saveState(pi);
+        return {
+          content: textContent("cprune: pruning disabled. cprune_status action=\"context-stat\" still simulates potential savings."),
+          details: { enabled, stats },
+        };
+      }
+
+      if (action === "context-stat") {
+        return {
+          content: textContent(contextStatText(ctx)),
+          details: { enabled, stats, seenOutputHashes: seenOutputs.size },
+        };
+      }
+
+      if (action === "compact") {
         ctx.compact({
           customInstructions:
             "cprune tool-triggered compaction: remove duplicate/stale details and preserve only actionable continuation state.",
         });
-        return { content: textContent("cprune: compaction requested"), details: { stats } };
+        return { content: textContent("cprune: compaction requested"), details: { enabled, stats } };
       }
-      return { content: textContent(statusText(ctx)), details: { stats, seenOutputHashes: seenOutputs.size } };
+
+      return { content: textContent(statusText(ctx)), details: { enabled, stats, seenOutputHashes: seenOutputs.size } };
     },
   });
 }

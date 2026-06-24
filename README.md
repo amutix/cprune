@@ -24,6 +24,18 @@ Or install/configure it as a Pi package; `package.json` exposes `src/cprune.ts` 
 /cprune compact       Trigger cprune-focused compaction
 ```
 
-`/cprune context-stat` works whether pruning is on or off, so you can compare estimated savings before enabling it.
+## Tool
+
+cprune also registers an LLM-callable tool named `cprune_status` with actions:
+
+```text
+status        Show cumulative pruning counters
+context-stat  Compare raw context vs simulated cprune-pruned context
+on            Enable pruning
+off           Disable pruning
+compact       Trigger cprune-focused compaction
+```
+
+`/cprune context-stat` and `cprune_status action="context-stat"` work whether pruning is on or off, so you can compare estimated savings before enabling it.
 
 Note: turning pruning off prevents future pruning. It does not reconstruct tool outputs that were already pruned before persistence.
