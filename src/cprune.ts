@@ -41,6 +41,8 @@ type CpruneStats = {
   contextSupersededCommands: number;
   contextChunkPruned: number;
   contextCustomMessagesPruned: number;
+  contextEntityPruned: number;
+  contextToolCallArgsPruned: number;
   contextTruncations: number;
   thinkingBlocksDropped: number;
   approxCharsSaved: number;
@@ -51,6 +53,8 @@ type CpruneStats = {
   savedSupersededCommandChars: number;
   savedChunkChars: number;
   savedCustomChars: number;
+  savedEntityChars: number;
+  savedToolCallArgChars: number;
   savedTruncationChars: number;
   compactionsTriggered: number;
 };
@@ -68,6 +72,9 @@ const config = {
   keepRecentMessagesUntouched: 24,
   maxContextToolResultChars: 6_000,
   maxContextCustomMessageChars: 4_000,
+  maxEntityPreviewChars: 1_200,
+  minEntityPruneChars: 1_800,
+  maxToolCallArgStringChars: 1_200,
   minRepeatedChunkLines: 24,
   minRepeatedChunkChars: 1_200,
   maxSeenHashes: 300,
@@ -90,6 +97,8 @@ const stats: CpruneStats = {
   contextSupersededCommands: 0,
   contextChunkPruned: 0,
   contextCustomMessagesPruned: 0,
+  contextEntityPruned: 0,
+  contextToolCallArgsPruned: 0,
   contextTruncations: 0,
   thinkingBlocksDropped: 0,
   approxCharsSaved: 0,
@@ -100,6 +109,8 @@ const stats: CpruneStats = {
   savedSupersededCommandChars: 0,
   savedChunkChars: 0,
   savedCustomChars: 0,
+  savedEntityChars: 0,
+  savedToolCallArgChars: 0,
   savedTruncationChars: 0,
   compactionsTriggered: 0,
 };
@@ -209,6 +220,91 @@ function truncateMiddle(text: string, maxChars: number, label: string): { text: 
     text: `${text.slice(0, head)}${marker}${tail > 0 ? text.slice(-tail) : ""}`,
     saved: text.length - maxChars,
   };
+}
+
+const ENTITY_ID_RE = /\b(?:TASK|SPEC|DISC|ISSUE|BUG|PR|MR|EPIC|INIT|MILESTONE|REQ|DOC)-\d+\b/gi;
+
+type EntitySeen = { index: number; hash: string; ids: string[]; chars: number };
+
+function extractEntityIds(text: string): string[] {
+  return [...new Set([...text.matchAll(ENTITY_ID_RE)].map((match) => match[0].toUpperCase()))];
+}
+
+function normalizeEntityText(text: string): string {
+  return stripAnsi(text)
+    .replace(/\r\n?/g, "\n")
+    .replace(/^\s*\[[^\]]{0,160}\]\s*/gm, "")
+    .replace(/\b\d{4}-\d{2}-\d{2}[T ][0-9:.+-Z]*\b/g, "<time>")
+    .replace(/\b[0-9a-f]{7,40}\b/gi, "<hash>")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+    .toLowerCase();
+}
+
+function previewEntityText(text: string, maxChars = config.maxEntityPreviewChars): string {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line, index) => index < 2 || /\b(?:TASK|SPEC|DISC|ISSUE|BUG|PR|MR|EPIC|INIT|MILESTONE|REQ|DOC)-\d+\b/i.test(line));
+  const preview = lines.slice(0, 8).join("\n").trim() || text.slice(0, maxChars);
+  return truncateMiddle(preview, maxChars, "entity preview").text;
+}
+
+function messageTextForEntities(message: AnyMessage): string {
+  if (!message) return "";
+  if (message.role === "assistant" && Array.isArray(message.content)) {
+    return message.content
+      .map((block: any) => {
+        if (block?.type === "text") return block.text ?? "";
+        if (block?.type === "toolCall") return safeJson(block.arguments ?? {}, 20_000);
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (message.role === "user" || message.role === "toolResult" || message.role === "custom") {
+    return textFromContent(message.content);
+  }
+  if (message.role === "compactionSummary" || message.role === "branchSummary") return String(message.summary ?? "");
+  return "";
+}
+
+function pruneEntityText(
+  text: string,
+  label: string,
+  index: number,
+  latestEntityIndex: Map<string, number>,
+  seenEntities: Map<string, EntitySeen>,
+): { text: string; saved: number; pruned: boolean; kind?: "duplicate" | "superseded" } {
+  if (text.length < config.minEntityPruneChars) return { text, saved: 0, pruned: false };
+  const ids = extractEntityIds(text);
+  if (ids.length === 0) return { text, saved: 0, pruned: false };
+
+  const normalized = normalizeEntityText(text);
+  if (!normalized) return { text, saved: 0, pruned: false };
+  const hash = hashText(normalized);
+  const duplicate = ids
+    .map((id) => seenEntities.get(`${id}:${hash}`))
+    .find((seen): seen is EntitySeen => seen !== undefined);
+
+  for (const id of ids) {
+    seenEntities.set(`${id}:${hash}`, { index, hash, ids, chars: text.length });
+  }
+
+  if (duplicate) {
+    const replacement = `[cprune: duplicate entity content omitted from ${label}; entities=${ids.join(",")}; same normalized content appeared at message index ${duplicate.index}; hash=${shortHash(hash)}.]`;
+    return { text: replacement, saved: Math.max(0, text.length - replacement.length), pruned: true, kind: "duplicate" };
+  }
+
+  const latest = Math.max(...ids.map((id) => latestEntityIndex.get(id) ?? index));
+  if (latest > index) {
+    const preview = previewEntityText(text);
+    const replacement = `[cprune: older entity snapshot compacted from ${label}; entities=${ids.join(",")}; newer mention appears at message index ${latest}; hash=${shortHash(hash)}; original=${text.length} chars.]\n${preview}`;
+    return { text: replacement, saved: Math.max(0, text.length - replacement.length), pruned: true, kind: "superseded" };
+  }
+
+  return { text, saved: 0, pruned: false };
 }
 
 function recordSavings(saved: number, field?: keyof CpruneStats) {
@@ -438,6 +534,101 @@ function pruneAssistantThinking(message: AnyMessage): { message: AnyMessage; sav
   };
 }
 
+function pruneArgValue(value: unknown, path: string): { value: unknown; saved: number; pruned: number } {
+  if (typeof value === "string") {
+    if (value.length <= config.maxToolCallArgStringChars) return { value, saved: 0, pruned: 0 };
+    const preview = value.slice(0, 220).replace(/\s+/g, " ").trim();
+    const replacement = `[cprune: omitted prior tool-call argument ${path}; ${value.length} chars; hash=${shortHash(hashText(value))}; preview=${JSON.stringify(preview)}]`;
+    return { value: replacement, saved: Math.max(0, value.length - replacement.length), pruned: 1 };
+  }
+
+  if (Array.isArray(value)) {
+    let saved = 0;
+    let pruned = 0;
+    const next = value.map((item, index) => {
+      const result = pruneArgValue(item, `${path}[${index}]`);
+      saved += result.saved;
+      pruned += result.pruned;
+      return result.value;
+    });
+    return { value: next, saved, pruned };
+  }
+
+  if (value && typeof value === "object") {
+    let saved = 0;
+    let pruned = 0;
+    const next: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      const result = pruneArgValue(child, path ? `${path}.${key}` : key);
+      saved += result.saved;
+      pruned += result.pruned;
+      next[key] = result.value;
+    }
+    return { value: next, saved, pruned };
+  }
+
+  return { value, saved: 0, pruned: 0 };
+}
+
+function pruneAssistantContext(
+  message: AnyMessage,
+  index: number,
+  latestEntityIndex: Map<string, number>,
+  seenEntities: Map<string, EntitySeen>,
+  successfulToolCallIds: Set<string>,
+): {
+  message: AnyMessage;
+  saved: number;
+  savedEntity: number;
+  savedToolArgs: number;
+  touched: boolean;
+  entityPruned: number;
+  toolArgsPruned: number;
+} {
+  if (message?.role !== "assistant" || !Array.isArray(message.content)) {
+    return { message, saved: 0, savedEntity: 0, savedToolArgs: 0, touched: false, entityPruned: 0, toolArgsPruned: 0 };
+  }
+
+  let saved = 0;
+  let savedEntity = 0;
+  let savedToolArgs = 0;
+  let touched = false;
+  let entityPruned = 0;
+  let toolArgsPruned = 0;
+
+  const content = message.content.map((block: any) => {
+    if (block?.type === "text" && typeof block.text === "string") {
+      const pruned = pruneEntityText(block.text, "assistant text", index, latestEntityIndex, seenEntities);
+      if (pruned.pruned) {
+        saved += pruned.saved;
+        savedEntity += pruned.saved;
+        touched = true;
+        entityPruned++;
+        return { ...block, text: pruned.text };
+      }
+      return block;
+    }
+
+    if (block?.type === "toolCall" && successfulToolCallIds.has(block.id)) {
+      const result = pruneArgValue(block.arguments ?? {}, `${block.name ?? "tool"}.arguments`);
+      if (result.pruned > 0) {
+        saved += result.saved;
+        savedToolArgs += result.saved;
+        touched = true;
+        toolArgsPruned += result.pruned;
+        return { ...block, arguments: result.value };
+      }
+    }
+
+    return block;
+  });
+
+  if (!touched) {
+    return { message, saved: 0, savedEntity: 0, savedToolArgs: 0, touched: false, entityPruned: 0, toolArgsPruned: 0 };
+  }
+  return { message: { ...message, content }, saved, savedEntity, savedToolArgs, touched, entityPruned, toolArgsPruned };
+}
+
 function rememberContextFingerprint(
   fingerprints: OutputFingerprint[],
   hash: string,
@@ -509,8 +700,18 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
   const latestReadByPath = new Map<string, number>();
   const latestMutationByPath = new Map<string, number>();
   const latestSnapshotCommand = new Map<string, number>();
+  const latestEntityIndex = new Map<string, number>();
+  const successfulToolCallIds = new Set<string>();
 
   messages.forEach((message, index) => {
+    for (const id of extractEntityIds(messageTextForEntities(message))) {
+      latestEntityIndex.set(id, index);
+    }
+
+    if (message?.role === "toolResult" && !message.isError && typeof message.toolCallId === "string") {
+      successfulToolCallIds.add(message.toolCallId);
+    }
+
     if (message?.role === "toolResult") {
       const call = calls.get(message.toolCallId);
       if (call?.name === "read") {
@@ -535,6 +736,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
 
   const contextFingerprints: OutputFingerprint[] = [];
   const seenChunks = new Map<string, ChunkSeen>();
+  const seenEntities = new Map<string, EntitySeen>();
   let touched = 0;
 
   return messages.map((message, index) => {
@@ -551,10 +753,41 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
       touched++;
     }
 
+    const assistant = pruneAssistantContext(current, index, latestEntityIndex, seenEntities, successfulToolCallIds);
+    if (assistant.touched) {
+      current = assistant.message;
+      stats.contextEntityPruned += assistant.entityPruned;
+      stats.contextToolCallArgsPruned += assistant.toolArgsPruned;
+      recordSavings(assistant.savedEntity, "savedEntityChars");
+      recordSavings(assistant.savedToolArgs, "savedToolCallArgChars");
+      touched++;
+    }
+
+    if (current?.role === "compactionSummary" || current?.role === "branchSummary") {
+      const fullText = String(current.summary ?? "");
+      const entityPruned = pruneEntityText(fullText, current.role, index, latestEntityIndex, seenEntities);
+      if (entityPruned.pruned) {
+        stats.contextEntityPruned++;
+        touched++;
+        recordSavings(entityPruned.saved, "savedEntityChars");
+        return { ...current, summary: entityPruned.text };
+      }
+      return current;
+    }
+
     if (current?.role === "custom") {
       const label = `custom:${current.customType ?? "message"}`;
       const fullText = textFromContent(current.content);
       if (!fullText) return current;
+
+      const entityPruned = pruneEntityText(fullText, label, index, latestEntityIndex, seenEntities);
+      if (entityPruned.pruned) {
+        stats.contextEntityPruned++;
+        stats.contextCustomMessagesPruned++;
+        touched++;
+        recordSavings(entityPruned.saved, "savedEntityChars");
+        return cloneWithText(current, entityPruned.text);
+      }
 
       if (fullText.length >= config.minDuplicateChars) {
         const hash = hashText(fullText);
@@ -611,6 +844,14 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
     const toolName = call?.name ?? current.toolName ?? "tool";
     const fullText = textFromContent(current.content);
     if (!fullText) return current;
+
+    const entityPruned = pruneEntityText(fullText, `${toolName} result`, index, latestEntityIndex, seenEntities);
+    if (entityPruned.pruned) {
+      stats.contextEntityPruned++;
+      touched++;
+      recordSavings(entityPruned.saved, "savedEntityChars");
+      return cloneWithText(current, entityPruned.text);
+    }
 
     // Stale file reads: an older read is superseded by a newer read of the same file
     // or by a later edit/write call to that file.
@@ -915,6 +1156,8 @@ function simulatePrunedContext(ctx: any) {
     supersededCommands: stats.contextSupersededCommands - snapshot.contextSupersededCommands,
     chunks: stats.contextChunkPruned - snapshot.contextChunkPruned,
     customMessages: stats.contextCustomMessagesPruned - snapshot.contextCustomMessagesPruned,
+    entities: stats.contextEntityPruned - snapshot.contextEntityPruned,
+    toolCallArgs: stats.contextToolCallArgsPruned - snapshot.contextToolCallArgsPruned,
     truncations: stats.contextTruncations - snapshot.contextTruncations,
     thinkingBlocks: stats.thinkingBlocksDropped - snapshot.thinkingBlocksDropped,
     touched: stats.contextMessagesTouched - snapshot.contextMessagesTouched,
@@ -926,6 +1169,8 @@ function simulatePrunedContext(ctx: any) {
     savedSupersededCommands: stats.savedSupersededCommandChars - snapshot.savedSupersededCommandChars,
     savedChunks: stats.savedChunkChars - snapshot.savedChunkChars,
     savedCustom: stats.savedCustomChars - snapshot.savedCustomChars,
+    savedEntities: stats.savedEntityChars - snapshot.savedEntityChars,
+    savedToolCallArgs: stats.savedToolCallArgChars - snapshot.savedToolCallArgChars,
     savedTruncations: stats.savedTruncationChars - snapshot.savedTruncationChars,
   };
   restoreStats(snapshot);
@@ -956,6 +1201,8 @@ function contextStatText(ctx: any): string {
     passDelta.supersededCommands,
     passDelta.chunks,
     passDelta.customMessages,
+    passDelta.entities,
+    passDelta.toolCallArgs,
     passDelta.truncations,
     passDelta.thinkingBlocks,
   );
@@ -984,6 +1231,8 @@ function contextStatText(ctx: any): string {
     `  ${countBar("append/contained repeats", passDelta.appendPruned, maxRuleCount)}`,
     `  ${countBar("repeated line chunks", passDelta.chunks, maxRuleCount)}`,
     `  ${countBar("custom messages pruned", passDelta.customMessages, maxRuleCount)}`,
+    `  ${countBar("entity snapshots pruned", passDelta.entities, maxRuleCount)}`,
+    `  ${countBar("tool-call args pruned", passDelta.toolCallArgs, maxRuleCount)}`,
     `  ${countBar("superseded snapshot commands", passDelta.supersededCommands, maxRuleCount)}`,
     `  ${countBar("oversized old results", passDelta.truncations, maxRuleCount)}`,
     `  ${countBar("exact duplicates", passDelta.duplicates, maxRuleCount)}`,
@@ -994,6 +1243,8 @@ function contextStatText(ctx: any): string {
     `  ${countBar("append/repeat chars", passDelta.savedAppend, Math.max(1, passDelta.saved))}`,
     `  ${countBar("chunk chars", passDelta.savedChunks, Math.max(1, passDelta.saved))}`,
     `  ${countBar("custom msg chars", passDelta.savedCustom, Math.max(1, passDelta.saved))}`,
+    `  ${countBar("entity chars", passDelta.savedEntities, Math.max(1, passDelta.saved))}`,
+    `  ${countBar("tool-call arg chars", passDelta.savedToolCallArgs, Math.max(1, passDelta.saved))}`,
     `  ${countBar("truncation chars", passDelta.savedTruncations, Math.max(1, passDelta.saved))}`,
     `  ${countBar("superseded cmd chars", passDelta.savedSupersededCommands, Math.max(1, passDelta.saved))}`,
     `  ${countBar("duplicate chars", passDelta.savedDuplicates, Math.max(1, passDelta.saved))}`,
@@ -1030,6 +1281,8 @@ function statusText(ctx?: any): string {
     `  append/contained repeats : ${fmtInt(stats.contextAppendPruned)}`,
     `  repeated line chunks     : ${fmtInt(stats.contextChunkPruned)}`,
     `  custom messages pruned   : ${fmtInt(stats.contextCustomMessagesPruned)}`,
+    `  entity snapshots pruned  : ${fmtInt(stats.contextEntityPruned)}`,
+    `  tool-call args pruned    : ${fmtInt(stats.contextToolCallArgsPruned)}`,
     `  superseded commands      : ${fmtInt(stats.contextSupersededCommands)}`,
     `  old results truncated    : ${fmtInt(stats.contextTruncations)}`,
     `  thinking blocks dropped  : ${fmtInt(stats.thinkingBlocksDropped)}`,
@@ -1043,6 +1296,8 @@ function statusText(ctx?: any): string {
     `  superseded commands       : ${fmtInt(stats.savedSupersededCommandChars)} chars`,
     `  repeated chunks           : ${fmtInt(stats.savedChunkChars)} chars`,
     `  custom messages           : ${fmtInt(stats.savedCustomChars)} chars`,
+    `  entities                  : ${fmtInt(stats.savedEntityChars)} chars`,
+    `  tool-call args            : ${fmtInt(stats.savedToolCallArgChars)} chars`,
     `  truncation                : ${fmtInt(stats.savedTruncationChars)} chars`,
   ].join("\n");
 }
