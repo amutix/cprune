@@ -1802,7 +1802,10 @@ function reviewHistoryMessages(ctx: any): AnyMessage[] {
       if (entry.type === "branch_summary") return { role: "branchSummary", summary: entry.summary };
       return undefined;
     })
-    .filter(Boolean);
+    // Raw branch history includes direct shell executions. `!!cmd` entries have
+    // excludeFromContext=true and are omitted by Pi anyway; even visible `!cmd`
+    // entries are not user prompts. Keep review-prompts focused on actual prompts.
+    .filter((message: any) => Boolean(message) && message.role !== "bashExecution");
 }
 
 function turnCandidates(ctx: any, limit: number): TurnCandidate[] {
