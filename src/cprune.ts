@@ -1799,7 +1799,9 @@ type TurnCandidate = {
   preview: string;
 };
 
-function reviewHistoryMessages(ctx: any): AnyMessage[] {
+type ReviewPromptMode = "safe" | "full";
+
+function reviewHistoryMessages(ctx: any, mode: ReviewPromptMode): AnyMessage[] {
   const branch = ctx.sessionManager?.getBranch?.();
   if (!Array.isArray(branch) || branch.length === 0) return currentContextMessages(ctx);
   return branch
@@ -1812,24 +1814,31 @@ function reviewHistoryMessages(ctx: any): AnyMessage[] {
       if (entry.type === "branch_summary") return { role: "branchSummary", summary: entry.summary };
       return undefined;
     })
-    // Raw branch history includes direct shell executions. `!!cmd` entries have
-    // excludeFromContext=true and are omitted by Pi anyway. Keep normal `!cmd`
-    // entries visible so cprune review mirrors Pi's context behavior.
-    .filter((message: any) => Boolean(message) && !(message.role === "bashExecution" && message.excludeFromContext === true));
+    // Safe mode mirrors Pi prompt behavior by hiding `!!cmd` shell entries with
+    // excludeFromContext=true. Full mode shows raw branch history, including them.
+    .filter((message: any) => Boolean(message) && (mode === "full" || !(message.role === "bashExecution" && message.excludeFromContext === true)));
 }
 
-function turnCandidates(ctx: any, limit: number): TurnCandidate[] {
-  const messages = reviewHistoryMessages(ctx);
+function isPromptReviewShellExecution(message: AnyMessage, mode: ReviewPromptMode): boolean {
+  return message?.role === "bashExecution" && (mode === "full" || message.excludeFromContext !== true);
+}
+
+function isPromptReviewStartInMode(message: AnyMessage, mode: ReviewPromptMode): boolean {
+  return message?.role === "user" || isPromptReviewShellExecution(message, mode);
+}
+
+function turnCandidates(ctx: any, limit: number, mode: ReviewPromptMode): TurnCandidate[] {
+  const messages = reviewHistoryMessages(ctx, mode);
   const starts = messages
-    .map((message, index) => (isPromptReviewStart(message) ? index : -1))
+    .map((message, index) => (isPromptReviewStartInMode(message, mode) ? index : -1))
     .filter((index) => index >= 0)
     .slice(-Math.max(1, limit));
 
   return starts
     .map((start): TurnCandidate | undefined => {
       let end = start + 1;
-      if (!isVisibleShellExecution(messages[start])) {
-        while (end < messages.length && !isPromptReviewStart(messages[end])) end++;
+      if (!isPromptReviewShellExecution(messages[start], mode)) {
+        while (end < messages.length && !isPromptReviewStartInMode(messages[end], mode)) end++;
       }
       const turn = messages.slice(start, end);
       const userText = stableMessageText(messages[start]).trim();
@@ -1841,7 +1850,9 @@ function turnCandidates(ctx: any, limit: number): TurnCandidate[] {
         start,
         end: end - 1,
         hash,
-        label: isVisibleShellExecution(messages[start]) ? `#${start} shell command` : `#${start} prompt/response turn`,
+        label: isPromptReviewShellExecution(messages[start], mode)
+          ? `#${start} ${messages[start].excludeFromContext === true ? "hidden shell command" : "shell command"}`
+          : `#${start} prompt/response turn`,
         chars,
         messageCount: turn.length,
         preview: previewEntityText(userText, 180),
@@ -1855,10 +1866,10 @@ function turnCandidateOption(candidate: TurnCandidate): string {
   return `${fmtInt(candidate.chars).padStart(8)} chars | #${candidate.start}-${candidate.end} ${candidate.messageCount} msgs | ${candidate.preview.replace(/\s+/g, " ").slice(0, 100)}`;
 }
 
-async function reviewCommandTurns(ctx: any, pi: ExtensionAPI, limit: number, startPage = 1) {
-  const candidates = turnCandidates(ctx, limit);
+async function reviewCommandTurns(ctx: any, pi: ExtensionAPI, limit: number, startPage = 1, mode: ReviewPromptMode = "safe") {
+  const candidates = turnCandidates(ctx, limit, mode);
   if (candidates.length === 0) {
-    ctx.ui.notify(`cprune: no prompt/response turns found in last ${limit} prompts`, "info");
+    ctx.ui.notify(`cprune: no prompt/response turns found in last ${limit} prompts (${mode} mode)`, "info");
     return;
   }
 
@@ -1876,7 +1887,7 @@ async function reviewCommandTurns(ctx: any, pi: ExtensionAPI, limit: number, sta
     options.push("Cancel");
 
     const choice = await ctx.ui.select(
-      `cprune: choose a prompt/response turn to exclude (page ${page + 1}/${totalPages}, last ${limit} prompts)`,
+      `cprune: choose a prompt/response turn to exclude (${mode} mode, page ${page + 1}/${totalPages}, last ${limit} prompts)`,
       options,
     );
     if (!choice || choice === "Cancel") return;
@@ -2126,9 +2137,14 @@ export default function cprune(pi: ExtensionAPI) {
       }
 
       if (action === "review-prompts" || action === "review-command" || action === "review-turns") {
-        const limit = Number.isFinite(Number(parts[1])) ? Math.max(1, Math.min(200, Math.floor(Number(parts[1])))) : 10;
-        const page = Number.isFinite(Number(parts[2])) ? Math.max(1, Math.floor(Number(parts[2]))) : 1;
-        await reviewCommandTurns(ctx, pi, limit, page);
+        const mode: ReviewPromptMode = parts.includes("full") ? "full" : "safe";
+        const numbers = parts
+          .slice(1)
+          .map((part) => Number(part))
+          .filter(Number.isFinite);
+        const limit = Number.isFinite(numbers[0]) ? Math.max(1, Math.min(200, Math.floor(numbers[0]))) : 10;
+        const page = Number.isFinite(numbers[1]) ? Math.max(1, Math.floor(numbers[1])) : 1;
+        await reviewCommandTurns(ctx, pi, limit, page, mode);
         return;
       }
 
@@ -2149,7 +2165,7 @@ export default function cprune(pi: ExtensionAPI) {
         });
         return;
       }
-      ctx.ui.notify("Usage: /cprune [on|off|status|stats|review|review-prompts [N] [page]|clear-exclusions|compact]", "warning");
+      ctx.ui.notify("Usage: /cprune [on|off|status|stats|review|review-prompts [safe|full] [N] [page]|clear-exclusions|compact]", "warning");
     },
   });
 
