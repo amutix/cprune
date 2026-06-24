@@ -145,8 +145,18 @@ type ManualOmission = {
   createdAt: number;
 };
 
+type ManualTurnOmission = {
+  hash: string;
+  label: string;
+  chars: number;
+  messageCount: number;
+  preview: string;
+  createdAt: number;
+};
+
 const seenOutputs = new Map<string, SeenOutput>();
 const manualOmissions = new Map<string, ManualOmission>();
+const manualTurnOmissions = new Map<string, ManualTurnOmission>();
 let lastCompactAt = 0;
 let compactInFlight = false;
 let enabled = true;
@@ -648,6 +658,13 @@ function loadStateFromSession(ctx: any) {
       if (item?.hash) manualOmissions.set(item.hash, item);
     }
   }
+
+  if (Array.isArray(stateEntry.data.manualTurnOmissions)) {
+    manualTurnOmissions.clear();
+    for (const item of stateEntry.data.manualTurnOmissions) {
+      if (item?.hash) manualTurnOmissions.set(item.hash, item);
+    }
+  }
 }
 
 function saveState(pi: ExtensionAPI) {
@@ -657,6 +674,7 @@ function saveState(pi: ExtensionAPI) {
     lastCompactAt,
     seenOutputs: [...seenOutputs.values()].slice(-config.maxSeenHashes),
     manualOmissions: [...manualOmissions.values()],
+    manualTurnOmissions: [...manualTurnOmissions.values()],
     savedAt: Date.now(),
   });
 }
@@ -906,6 +924,9 @@ function pruneRepeatedLineChunks(
 function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
   stats.contextPasses++;
 
+  const turnOmitted = applyManualTurnOmissions(messages);
+  messages = turnOmitted.messages;
+
   const calls = getAssistantToolCalls(messages);
   const recentStart = Math.max(0, messages.length - config.keepRecentMessagesUntouched);
   const latestReadByPath = new Map<string, number>();
@@ -954,7 +975,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
   const contextFingerprints: OutputFingerprint[] = [];
   const seenChunks = new Map<string, ChunkSeen>();
   const seenEntities = new Map<string, EntitySeen>();
-  let touched = 0;
+  let touched = turnOmitted.touched;
 
   return messages.map((message, index) => {
     // Keep the very recent tail pristine so active tool-use protocol stays high fidelity.
@@ -1301,6 +1322,49 @@ function manualOmissionReplacement(omission: ManualOmission): string {
   return `[cprune: user-excluded context omitted; label=${omission.label}; hash=${shortHash(omission.hash)}; original=${omission.chars} chars; preview=${JSON.stringify(omission.preview)}.]`;
 }
 
+function turnOmissionHash(turnMessages: AnyMessage[]): string {
+  return hashText(`turn\n${turnMessages.map(stableMessageText).join("\n---\n")}`);
+}
+
+function manualTurnOmissionReplacement(omission: ManualTurnOmission, actualChars: number): string {
+  return `[cprune: user-excluded prompt/response turn omitted; label=${omission.label}; hash=${shortHash(omission.hash)}; messages=${omission.messageCount}; original=${actualChars} chars; preview=${JSON.stringify(omission.preview)}.]`;
+}
+
+function applyManualTurnOmissions(messages: AnyMessage[]): { messages: AnyMessage[]; touched: number } {
+  if (manualTurnOmissions.size === 0) return { messages, touched: 0 };
+
+  const result: AnyMessage[] = [];
+  let touched = 0;
+  for (let index = 0; index < messages.length; ) {
+    const message = messages[index];
+    if (message?.role !== "user") {
+      result.push(message);
+      index++;
+      continue;
+    }
+
+    let end = index + 1;
+    while (end < messages.length && messages[end]?.role !== "user") end++;
+
+    const omitted = messages.slice(index, end);
+    const omission = manualTurnOmissions.get(turnOmissionHash(omitted));
+    if (!omission) {
+      result.push(message);
+      index++;
+      continue;
+    }
+    const actualChars = omitted.reduce((sum, item) => sum + roughMessageChars(item), 0);
+    const replacement = manualTurnOmissionReplacement(omission, actualChars);
+    result.push({ role: "user", content: textContent(replacement) });
+    stats.manualContextOmissions++;
+    recordSavings(Math.max(0, actualChars - replacement.length), "savedManualOmissionChars");
+    touched++;
+    index = end;
+  }
+
+  return { messages: result, touched };
+}
+
 function contextSize(messages: AnyMessage[]) {
   const chars = messages.reduce((sum, message) => sum + roughMessageChars(message), 0);
   return {
@@ -1621,7 +1685,7 @@ function statusText(ctx?: any): string {
     `  pruning                  : ${enabled ? "on" : "off"}`,
     `  ${usageLine}`,
     `  seen output hashes       : ${fmtInt(seenOutputs.size)}`,
-    `  user exclusions          : ${fmtInt(manualOmissions.size)}`,
+    `  user exclusions          : ${fmtInt(manualOmissions.size + manualTurnOmissions.size)}`,
     `  approx chars saved       : ${fmtInt(stats.approxCharsSaved)}`,
     "",
     "Persist-time pruning",
@@ -1712,6 +1776,85 @@ function largeContextCandidates(ctx: any): ReviewCandidate[] {
 function reviewCandidateOption(candidate: ReviewCandidate): string {
   const ids = candidate.ids.length ? ` ${candidate.ids.slice(0, 4).join(",")}` : "";
   return `${fmtInt(candidate.chars).padStart(8)} chars | ${candidate.label}${ids} | ${candidate.preview.replace(/\s+/g, " ").slice(0, 90)}`;
+}
+
+type TurnCandidate = {
+  start: number;
+  end: number;
+  hash: string;
+  label: string;
+  chars: number;
+  messageCount: number;
+  preview: string;
+};
+
+function turnCandidates(ctx: any, limit: number): TurnCandidate[] {
+  const messages = currentContextMessages(ctx);
+  const starts = messages
+    .map((message, index) => (message?.role === "user" ? index : -1))
+    .filter((index) => index >= 0)
+    .slice(-Math.max(1, limit));
+
+  return starts
+    .map((start): TurnCandidate | undefined => {
+      let end = start + 1;
+      while (end < messages.length && messages[end]?.role !== "user") end++;
+      const turn = messages.slice(start, end);
+      const userText = stableMessageText(messages[start]).trim();
+      if (!userText) return undefined;
+      const hash = turnOmissionHash(turn);
+      if (manualTurnOmissions.has(hash)) return undefined;
+      const chars = turn.reduce((sum, message) => sum + roughMessageChars(message), 0);
+      return {
+        start,
+        end: end - 1,
+        hash,
+        label: `#${start} prompt/response turn`,
+        chars,
+        messageCount: turn.length,
+        preview: previewEntityText(userText, 180),
+      };
+    })
+    .filter((item): item is TurnCandidate => Boolean(item))
+    .reverse();
+}
+
+function turnCandidateOption(candidate: TurnCandidate): string {
+  return `${fmtInt(candidate.chars).padStart(8)} chars | #${candidate.start}-${candidate.end} ${candidate.messageCount} msgs | ${candidate.preview.replace(/\s+/g, " ").slice(0, 100)}`;
+}
+
+async function reviewCommandTurns(ctx: any, pi: ExtensionAPI, limit: number) {
+  const candidates = turnCandidates(ctx, limit);
+  if (candidates.length === 0) {
+    ctx.ui.notify(`cprune: no prompt/response turns found in last ${limit} prompts`, "info");
+    return;
+  }
+
+  const options = candidates.map(turnCandidateOption);
+  options.push("Cancel");
+  const choice = await ctx.ui.select(`cprune: choose a prompt/response turn to exclude (last ${limit} prompts)`, options);
+  if (!choice || choice === "Cancel") return;
+
+  const index = options.indexOf(choice);
+  const candidate = candidates[index];
+  if (!candidate) return;
+
+  const ok = await ctx.ui.confirm(
+    "Exclude this prompt/response turn?",
+    `${candidate.label}\nmessages #${candidate.start}-${candidate.end}\n${fmtInt(candidate.chars)} chars\n\nThis is non-destructive: cprune will omit the selected user prompt and its response/tool-results at prompt time, but it will not rewrite Pi session history.`,
+  );
+  if (!ok) return;
+
+  manualTurnOmissions.set(candidate.hash, {
+    hash: candidate.hash,
+    label: candidate.label,
+    chars: candidate.chars,
+    messageCount: candidate.messageCount,
+    preview: candidate.preview,
+    createdAt: Date.now(),
+  });
+  saveState(pi);
+  ctx.ui.notify(`cprune: excluded ${candidate.label} from future prompts`, "info");
 }
 
 async function reviewLargeContext(ctx: any, pi: ExtensionAPI) {
@@ -1890,9 +2033,10 @@ export default function cprune(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cprune", {
-    description: "Control cprune: /cprune on|off|status|stats|review|compact",
+    description: "Control cprune: /cprune on|off|status|stats|review|review-command|compact",
     handler: async (args, ctx) => {
-      const action = args.trim() || "status";
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const action = parts[0] ?? "status";
 
       if (action === "on") {
         enabled = true;
@@ -1925,9 +2069,16 @@ export default function cprune(pi: ExtensionAPI) {
         return;
       }
 
+      if (action === "review-command" || action === "review-turns") {
+        const limit = Number.isFinite(Number(parts[1])) ? Math.max(1, Math.min(50, Math.floor(Number(parts[1])))) : 10;
+        await reviewCommandTurns(ctx, pi, limit);
+        return;
+      }
+
       if (action === "clear-exclusions") {
-        const count = manualOmissions.size;
+        const count = manualOmissions.size + manualTurnOmissions.size;
         manualOmissions.clear();
+        manualTurnOmissions.clear();
         saveState(pi);
         ctx.ui.notify(`cprune: cleared ${count} user exclusions`, "info");
         return;
@@ -1941,7 +2092,7 @@ export default function cprune(pi: ExtensionAPI) {
         });
         return;
       }
-      ctx.ui.notify("Usage: /cprune [on|off|status|stats|review|clear-exclusions|compact]", "warning");
+      ctx.ui.notify("Usage: /cprune [on|off|status|stats|review|review-command [N]|clear-exclusions|compact]", "warning");
     },
   });
 
