@@ -39,9 +39,19 @@ type CpruneStats = {
   contextDuplicates: number;
   contextAppendPruned: number;
   contextSupersededCommands: number;
+  contextChunkPruned: number;
+  contextCustomMessagesPruned: number;
   contextTruncations: number;
   thinkingBlocksDropped: number;
   approxCharsSaved: number;
+  savedThinkingChars: number;
+  savedStaleReadChars: number;
+  savedDuplicateChars: number;
+  savedAppendChars: number;
+  savedSupersededCommandChars: number;
+  savedChunkChars: number;
+  savedCustomChars: number;
+  savedTruncationChars: number;
   compactionsTriggered: number;
 };
 
@@ -57,6 +67,9 @@ const config = {
   // Send-time pruning: non-destructive; only affects the LLM request context.
   keepRecentMessagesUntouched: 24,
   maxContextToolResultChars: 6_000,
+  maxContextCustomMessageChars: 4_000,
+  minRepeatedChunkLines: 24,
+  minRepeatedChunkChars: 1_200,
   maxSeenHashes: 300,
 
   // Background compaction trigger. Set to 0 to disable.
@@ -75,9 +88,19 @@ const stats: CpruneStats = {
   contextDuplicates: 0,
   contextAppendPruned: 0,
   contextSupersededCommands: 0,
+  contextChunkPruned: 0,
+  contextCustomMessagesPruned: 0,
   contextTruncations: 0,
   thinkingBlocksDropped: 0,
   approxCharsSaved: 0,
+  savedThinkingChars: 0,
+  savedStaleReadChars: 0,
+  savedDuplicateChars: 0,
+  savedAppendChars: 0,
+  savedSupersededCommandChars: 0,
+  savedChunkChars: 0,
+  savedCustomChars: 0,
+  savedTruncationChars: 0,
   compactionsTriggered: 0,
 };
 
@@ -188,8 +211,19 @@ function truncateMiddle(text: string, maxChars: number, label: string): { text: 
   };
 }
 
+function recordSavings(saved: number, field?: keyof CpruneStats) {
+  if (saved <= 0) return;
+  stats.approxCharsSaved += saved;
+  if (field) {
+    const current = stats[field];
+    if (typeof current === "number") {
+      (stats as any)[field] = current + saved;
+    }
+  }
+}
+
 function mergeStats(saved: number) {
-  if (saved > 0) stats.approxCharsSaved += saved;
+  recordSavings(saved);
 }
 
 function rememberOutput(hash: string, toolName: string, input: unknown, chars: number, text?: string): SeenOutput | undefined {
@@ -404,6 +438,69 @@ function pruneAssistantThinking(message: AnyMessage): { message: AnyMessage; sav
   };
 }
 
+function rememberContextFingerprint(
+  fingerprints: OutputFingerprint[],
+  hash: string,
+  index: number,
+  label: string,
+  text: string,
+) {
+  const fp = appendFingerprint(text);
+  fingerprints.push({
+    hash,
+    index,
+    toolName: label,
+    input: "context",
+    firstSeenAt: Date.now(),
+    count: 1,
+    chars: text.length,
+    normalizedHash: fp.normalizedHash,
+    normalizedChars: fp.normalizedChars,
+    normalizedLineCount: fp.normalizedLineCount,
+  });
+}
+
+type ChunkSeen = { index: number; label: string; chars: number };
+
+function pruneRepeatedLineChunks(
+  text: string,
+  label: string,
+  index: number,
+  seenChunks: Map<string, ChunkSeen>,
+): { text: string; saved: number; pruned: number } {
+  const lines = normalizedLinesForAppend(text);
+  if (lines.length < config.minRepeatedChunkLines * 2) return { text, saved: 0, pruned: 0 };
+
+  const rawLines = text.replace(/\r\n?/g, "\n").split("\n");
+  const out: string[] = [];
+  let saved = 0;
+  let pruned = 0;
+
+  for (let i = 0; i < lines.length; i += config.minRepeatedChunkLines) {
+    const chunkLines = lines.slice(i, i + config.minRepeatedChunkLines);
+    const chunkText = chunkLines.join("\n");
+    const rawChunk = rawLines.slice(i, i + config.minRepeatedChunkLines).join("\n");
+
+    if (chunkLines.length === config.minRepeatedChunkLines && chunkText.length >= config.minRepeatedChunkChars) {
+      const hash = hashText(`${label}\n${chunkText}`);
+      const seen = seenChunks.get(hash);
+      if (seen) {
+        const marker = `[cprune: omitted repeated ${label} chunk (${chunkLines.length} lines, ${rawChunk.length} chars); same chunk appeared at message index ${seen.index}.]`;
+        out.push(marker);
+        saved += Math.max(0, rawChunk.length - marker.length);
+        pruned++;
+        continue;
+      }
+      seenChunks.set(hash, { index, label, chars: rawChunk.length });
+    }
+
+    out.push(rawChunk);
+  }
+
+  if (pruned === 0) return { text, saved: 0, pruned: 0 };
+  return { text: out.join("\n"), saved, pruned };
+}
+
 function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
   stats.contextPasses++;
 
@@ -437,6 +534,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
   });
 
   const contextFingerprints: OutputFingerprint[] = [];
+  const seenChunks = new Map<string, ChunkSeen>();
   let touched = 0;
 
   return messages.map((message, index) => {
@@ -449,8 +547,62 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
     if (thinking.dropped > 0) {
       current = thinking.message;
       stats.thinkingBlocksDropped += thinking.dropped;
-      mergeStats(thinking.saved);
+      recordSavings(thinking.saved, "savedThinkingChars");
       touched++;
+    }
+
+    if (current?.role === "custom") {
+      const label = `custom:${current.customType ?? "message"}`;
+      const fullText = textFromContent(current.content);
+      if (!fullText) return current;
+
+      if (fullText.length >= config.minDuplicateChars) {
+        const hash = hashText(fullText);
+        const exact = contextFingerprints.find((fp) => fp.hash === hash && fp.toolName === label);
+        if (exact) {
+          stats.contextDuplicates++;
+          stats.contextCustomMessagesPruned++;
+          touched++;
+          recordSavings(Math.max(0, fullText.length - 170), "savedCustomChars");
+          return cloneWithText(
+            current,
+            `[cprune: duplicate ${label} message omitted; same content appeared earlier at message index ${exact.index}; hash=${shortHash(hash)}.]`,
+          );
+        }
+
+        const appended = findAppendedOutput(fullText, label, contextFingerprints);
+        if (appended) {
+          const replacement = appendedReplacement(fullText, label, appended);
+          stats.contextAppendPruned++;
+          stats.contextCustomMessagesPruned++;
+          touched++;
+          recordSavings(replacement.saved, "savedCustomChars");
+          rememberContextFingerprint(contextFingerprints, hash, index, label, fullText);
+          return cloneWithText(current, replacement.text);
+        }
+
+        rememberContextFingerprint(contextFingerprints, hash, index, label, fullText);
+      }
+
+      const chunked = pruneRepeatedLineChunks(fullText, label, index, seenChunks);
+      if (chunked.pruned > 0) {
+        stats.contextChunkPruned += chunked.pruned;
+        stats.contextCustomMessagesPruned++;
+        touched++;
+        recordSavings(chunked.saved, "savedChunkChars");
+        return cloneWithText(current, chunked.text);
+      }
+
+      const truncated = truncateMiddle(fullText, config.maxContextCustomMessageChars, `${label} message in request context`);
+      if (truncated.saved > 0) {
+        stats.contextTruncations++;
+        stats.contextCustomMessagesPruned++;
+        touched++;
+        recordSavings(truncated.saved, "savedCustomChars");
+        return cloneWithText(current, truncated.text);
+      }
+
+      return current;
     }
 
     if (current?.role !== "toolResult") return current;
@@ -471,7 +623,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
           const reason = newerRead !== undefined && newerRead > index ? "newer read exists" : "later edit/write exists";
           stats.contextStaleReads++;
           touched++;
-          mergeStats(Math.max(0, fullText.length - 120));
+          recordSavings(Math.max(0, fullText.length - 120), "savedStaleReadChars");
           return cloneWithText(
             current,
             `[cprune: stale read result omitted for ${path}; ${reason}. Re-read the file if exact old contents are needed.]`,
@@ -489,7 +641,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
       if (newerRun !== undefined && newerRun > index) {
         stats.contextSupersededCommands++;
         touched++;
-        mergeStats(Math.max(0, fullText.length - 180));
+        recordSavings(Math.max(0, fullText.length - 180), "savedSupersededCommandChars");
         return cloneWithText(
           current,
           `[cprune: superseded ${toolName} result omitted; command was run again at message index ${newerRun}. Command: ${command}]`,
@@ -504,7 +656,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
       if (exact) {
         stats.contextDuplicates++;
         touched++;
-        mergeStats(Math.max(0, fullText.length - 160));
+        recordSavings(Math.max(0, fullText.length - 160), "savedDuplicateChars");
         return cloneWithText(
           current,
           `[cprune: duplicate ${toolName} result omitted; same output appeared earlier at message index ${exact.index}; hash=${shortHash(hash)}.]`,
@@ -512,40 +664,27 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
       }
 
       const appended = findAppendedOutput(fullText, toolName, contextFingerprints);
-      const fp = appendFingerprint(fullText);
 
       if (appended) {
         const replacement = appendedReplacement(fullText, toolName, appended);
         stats.contextAppendPruned++;
         touched++;
-        mergeStats(replacement.saved);
-        contextFingerprints.push({
-          hash,
-          index,
-          toolName,
-          input: "context",
-          firstSeenAt: Date.now(),
-          count: 1,
-          chars: fullText.length,
-          normalizedHash: fp.normalizedHash,
-          normalizedChars: fp.normalizedChars,
-          normalizedLineCount: fp.normalizedLineCount,
-        });
+        recordSavings(replacement.saved, "savedAppendChars");
+        rememberContextFingerprint(contextFingerprints, hash, index, toolName, fullText);
         return cloneWithText(current, replacement.text);
       }
 
-      contextFingerprints.push({
-        hash,
-        index,
-        toolName,
-        input: "context",
-        firstSeenAt: Date.now(),
-        count: 1,
-        chars: fullText.length,
-        normalizedHash: fp.normalizedHash,
-        normalizedChars: fp.normalizedChars,
-        normalizedLineCount: fp.normalizedLineCount,
-      });
+      rememberContextFingerprint(contextFingerprints, hash, index, toolName, fullText);
+    }
+
+    // Repeated line chunks catch outputs that are mostly repeated but have changes
+    // inserted in the middle, where prefix/contained whole-output matching misses.
+    const chunked = pruneRepeatedLineChunks(fullText, toolName, index, seenChunks);
+    if (chunked.pruned > 0) {
+      stats.contextChunkPruned += chunked.pruned;
+      touched++;
+      recordSavings(chunked.saved, "savedChunkChars");
+      return cloneWithText(current, chunked.text);
     }
 
     // Oversized old tool outputs.
@@ -554,7 +693,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
     if (truncated.saved > 0) {
       stats.contextTruncations++;
       touched++;
-      mergeStats(truncated.saved);
+      recordSavings(truncated.saved, "savedTruncationChars");
       return cloneWithText(current, truncated.text);
     }
 
@@ -660,10 +799,20 @@ function simulatePrunedContext(ctx: any) {
     duplicates: stats.contextDuplicates - snapshot.contextDuplicates,
     appendPruned: stats.contextAppendPruned - snapshot.contextAppendPruned,
     supersededCommands: stats.contextSupersededCommands - snapshot.contextSupersededCommands,
+    chunks: stats.contextChunkPruned - snapshot.contextChunkPruned,
+    customMessages: stats.contextCustomMessagesPruned - snapshot.contextCustomMessagesPruned,
     truncations: stats.contextTruncations - snapshot.contextTruncations,
     thinkingBlocks: stats.thinkingBlocksDropped - snapshot.thinkingBlocksDropped,
     touched: stats.contextMessagesTouched - snapshot.contextMessagesTouched,
     saved: stats.approxCharsSaved - snapshot.approxCharsSaved,
+    savedThinking: stats.savedThinkingChars - snapshot.savedThinkingChars,
+    savedStaleReads: stats.savedStaleReadChars - snapshot.savedStaleReadChars,
+    savedDuplicates: stats.savedDuplicateChars - snapshot.savedDuplicateChars,
+    savedAppend: stats.savedAppendChars - snapshot.savedAppendChars,
+    savedSupersededCommands: stats.savedSupersededCommandChars - snapshot.savedSupersededCommandChars,
+    savedChunks: stats.savedChunkChars - snapshot.savedChunkChars,
+    savedCustom: stats.savedCustomChars - snapshot.savedCustomChars,
+    savedTruncations: stats.savedTruncationChars - snapshot.savedTruncationChars,
   };
   restoreStats(snapshot);
 
@@ -685,6 +834,8 @@ function contextStatText(ctx: any): string {
     passDelta.duplicates,
     passDelta.appendPruned,
     passDelta.supersededCommands,
+    passDelta.chunks,
+    passDelta.customMessages,
     passDelta.truncations,
     passDelta.thinkingBlocks,
   );
@@ -709,9 +860,21 @@ function contextStatText(ctx: any): string {
     `  ${countBar("old thinking blocks", passDelta.thinkingBlocks, maxRuleCount)}`,
     `  ${countBar("stale file reads", passDelta.staleReads, maxRuleCount)}`,
     `  ${countBar("append/contained repeats", passDelta.appendPruned, maxRuleCount)}`,
+    `  ${countBar("repeated line chunks", passDelta.chunks, maxRuleCount)}`,
+    `  ${countBar("custom messages pruned", passDelta.customMessages, maxRuleCount)}`,
     `  ${countBar("superseded snapshot commands", passDelta.supersededCommands, maxRuleCount)}`,
     `  ${countBar("oversized old results", passDelta.truncations, maxRuleCount)}`,
     `  ${countBar("exact duplicates", passDelta.duplicates, maxRuleCount)}`,
+    "",
+    "Savings by rule",
+    `  ${countBar("thinking chars", passDelta.savedThinking, Math.max(1, passDelta.saved))}`,
+    `  ${countBar("stale read chars", passDelta.savedStaleReads, Math.max(1, passDelta.saved))}`,
+    `  ${countBar("append/repeat chars", passDelta.savedAppend, Math.max(1, passDelta.saved))}`,
+    `  ${countBar("chunk chars", passDelta.savedChunks, Math.max(1, passDelta.saved))}`,
+    `  ${countBar("custom msg chars", passDelta.savedCustom, Math.max(1, passDelta.saved))}`,
+    `  ${countBar("truncation chars", passDelta.savedTruncations, Math.max(1, passDelta.saved))}`,
+    `  ${countBar("superseded cmd chars", passDelta.savedSupersededCommands, Math.max(1, passDelta.saved))}`,
+    `  ${countBar("duplicate chars", passDelta.savedDuplicates, Math.max(1, passDelta.saved))}`,
     "",
     `Rule-estimated saved chars: ${fmtInt(passDelta.saved)}`,
   ].join("\n");
@@ -743,10 +906,22 @@ function statusText(ctx?: any): string {
     `  stale reads              : ${fmtInt(stats.contextStaleReads)}`,
     `  exact duplicates         : ${fmtInt(stats.contextDuplicates)}`,
     `  append/contained repeats : ${fmtInt(stats.contextAppendPruned)}`,
+    `  repeated line chunks     : ${fmtInt(stats.contextChunkPruned)}`,
+    `  custom messages pruned   : ${fmtInt(stats.contextCustomMessagesPruned)}`,
     `  superseded commands      : ${fmtInt(stats.contextSupersededCommands)}`,
     `  old results truncated    : ${fmtInt(stats.contextTruncations)}`,
     `  thinking blocks dropped  : ${fmtInt(stats.thinkingBlocksDropped)}`,
     `  auto compactions         : ${fmtInt(stats.compactionsTriggered)}`,
+    "",
+    "Savings by rule",
+    `  thinking                  : ${fmtInt(stats.savedThinkingChars)} chars`,
+    `  stale reads               : ${fmtInt(stats.savedStaleReadChars)} chars`,
+    `  duplicates                : ${fmtInt(stats.savedDuplicateChars)} chars`,
+    `  append/contained          : ${fmtInt(stats.savedAppendChars)} chars`,
+    `  superseded commands       : ${fmtInt(stats.savedSupersededCommandChars)} chars`,
+    `  repeated chunks           : ${fmtInt(stats.savedChunkChars)} chars`,
+    `  custom messages           : ${fmtInt(stats.savedCustomChars)} chars`,
+    `  truncation                : ${fmtInt(stats.savedTruncationChars)} chars`,
   ].join("\n");
 }
 
