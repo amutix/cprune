@@ -649,7 +649,7 @@ function countBar(label: string, value: number, max: number): string {
   return `${padded} ${bar(value, max, 18)} ${fmtInt(value)}`;
 }
 
-function contextStatText(ctx: any): string {
+function simulatePrunedContext(ctx: any) {
   const rawMessages = currentContextMessages(ctx);
   const before = contextSize(rawMessages);
 
@@ -667,7 +667,11 @@ function contextStatText(ctx: any): string {
   };
   restoreStats(snapshot);
 
-  const after = contextSize(prunedMessages);
+  return { before, after: contextSize(prunedMessages), passDelta };
+}
+
+function contextStatText(ctx: any): string {
+  const { before, after, passDelta } = simulatePrunedContext(ctx);
   const savedChars = Math.max(0, before.chars - after.chars);
   const savedPct = before.chars > 0 ? (savedChars / before.chars) * 100 : 0;
   const usage = ctx.getContextUsage?.();
@@ -751,6 +755,17 @@ function maybeTriggerCompaction(ctx: any) {
 
   const usage = ctx.getContextUsage?.();
   if (!usage?.percent || usage.percent < config.autoCompactAtPercent) return;
+
+  // ctx.getContextUsage() is based on Pi's unpruned session state. Because cprune
+  // prunes at the LLM boundary, only compact when the simulated pruned footprint
+  // is also above the threshold. Preserve any model-reported overhead (system
+  // prompt/tool schemas/etc.) by adding it back to the pruned message estimate.
+  const footprint = simulatePrunedContext(ctx);
+  const reportedTokens = typeof usage.tokens === "number" ? usage.tokens : footprint.before.approxTokens;
+  const overheadTokens = Math.max(0, reportedTokens - footprint.before.approxTokens);
+  const prunedEstimatedTokens = overheadTokens + footprint.after.approxTokens;
+  const prunedPercent = usage.contextWindow > 0 ? (prunedEstimatedTokens / usage.contextWindow) * 100 : usage.percent;
+  if (prunedPercent < config.autoCompactAtPercent) return;
 
   const now = Date.now();
   if (now - lastCompactAt < config.compactCooldownMs) return;
