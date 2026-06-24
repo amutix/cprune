@@ -630,6 +630,25 @@ function currentContextMessages(ctx: any): AnyMessage[] {
     .filter(Boolean);
 }
 
+function fmtInt(value: number): string {
+  return value.toLocaleString();
+}
+
+function fmtPct(value: number): string {
+  return `${value.toFixed(1)}%`;
+}
+
+function bar(value: number, max: number, width = 32): string {
+  if (max <= 0) return "░".repeat(width);
+  const filled = Math.max(0, Math.min(width, Math.round((value / max) * width)));
+  return `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
+}
+
+function countBar(label: string, value: number, max: number): string {
+  const padded = label.padEnd(29);
+  return `${padded} ${bar(value, max, 18)} ${fmtInt(value)}`;
+}
+
 function contextStatText(ctx: any): string {
   const rawMessages = currentContextMessages(ctx);
   const before = contextSize(rawMessages);
@@ -656,21 +675,41 @@ function contextStatText(ctx: any): string {
     ? `${usage.tokens ?? "unknown"}/${usage.contextWindow} tokens (${usage.percent?.toFixed(1) ?? "?"}%)`
     : "unknown";
 
+  const maxRuleCount = Math.max(
+    1,
+    passDelta.staleReads,
+    passDelta.duplicates,
+    passDelta.appendPruned,
+    passDelta.supersededCommands,
+    passDelta.truncations,
+    passDelta.thinkingBlocks,
+  );
+  const rawPct = before.chars > 0 ? 100 : 0;
+  const afterPct = before.chars > 0 ? (after.chars / before.chars) * 100 : 0;
+
   return [
     "cprune context-stat",
-    `pruning currently: ${enabled ? "on" : "off"}`,
-    `model-reported context: ${modelUsage}`,
-    `raw context: ${before.messages} messages, ${before.chars.toLocaleString()} chars, ~${before.approxTokens.toLocaleString()} tokens`,
-    `with cprune: ${after.messages} messages, ${after.chars.toLocaleString()} chars, ~${after.approxTokens.toLocaleString()} tokens`,
-    `estimated savings if on: ${savedChars.toLocaleString()} chars (~${Math.ceil(savedChars / 4).toLocaleString()} tokens, ${savedPct.toFixed(1)}%)`,
-    `messages touched: ${passDelta.touched}`,
-    `stale reads: ${passDelta.staleReads}`,
-    `exact duplicates: ${passDelta.duplicates}`,
-    `append/contained repeats: ${passDelta.appendPruned}`,
-    `superseded snapshot commands: ${passDelta.supersededCommands}`,
-    `oversized old results truncated: ${passDelta.truncations}`,
-    `old thinking blocks dropped: ${passDelta.thinkingBlocks}`,
-    `pass-estimated saved chars by rules: ${passDelta.saved.toLocaleString()}`,
+    "",
+    "Summary",
+    `  pruning           : ${enabled ? "on" : "off"}`,
+    `  model context     : ${modelUsage}`,
+    `  messages          : ${fmtInt(before.messages)} total, ${fmtInt(passDelta.touched)} touched`,
+    `  estimated savings : ${fmtInt(savedChars)} chars (~${fmtInt(Math.ceil(savedChars / 4))} tokens, ${fmtPct(savedPct)})`,
+    "",
+    "Before / after",
+    `  raw      ${bar(before.chars, before.chars)} ${fmtInt(before.chars)} chars  ~${fmtInt(before.approxTokens)} tok  ${fmtPct(rawPct)}`,
+    `  cprune   ${bar(after.chars, before.chars)} ${fmtInt(after.chars)} chars  ~${fmtInt(after.approxTokens)} tok  ${fmtPct(afterPct)}`,
+    `  saved    ${bar(savedChars, before.chars)} ${fmtInt(savedChars)} chars  ~${fmtInt(Math.ceil(savedChars / 4))} tok  ${fmtPct(savedPct)}`,
+    "",
+    "Rule hits in this simulation",
+    `  ${countBar("old thinking blocks", passDelta.thinkingBlocks, maxRuleCount)}`,
+    `  ${countBar("stale file reads", passDelta.staleReads, maxRuleCount)}`,
+    `  ${countBar("append/contained repeats", passDelta.appendPruned, maxRuleCount)}`,
+    `  ${countBar("superseded snapshot commands", passDelta.supersededCommands, maxRuleCount)}`,
+    `  ${countBar("oversized old results", passDelta.truncations, maxRuleCount)}`,
+    `  ${countBar("exact duplicates", passDelta.duplicates, maxRuleCount)}`,
+    "",
+    `Rule-estimated saved chars: ${fmtInt(passDelta.saved)}`,
   ].join("\n");
 }
 
@@ -682,22 +721,28 @@ function statusText(ctx?: any): string {
 
   return [
     "cprune status",
-    `pruning: ${enabled ? "on" : "off"}`,
-    usageLine,
-    `seen output hashes: ${seenOutputs.size}`,
-    `tool results seen: ${stats.toolResultsSeen}`,
-    `persist-time deduped: ${stats.toolResultsDeduped}`,
-    `persist-time append-pruned: ${stats.toolResultsAppendPruned}`,
-    `persist-time truncated: ${stats.toolResultsTruncated}`,
-    `context passes: ${stats.contextPasses}`,
-    `context stale reads pruned: ${stats.contextStaleReads}`,
-    `context duplicate results pruned: ${stats.contextDuplicates}`,
-    `context append/contained-pruned results: ${stats.contextAppendPruned}`,
-    `context superseded snapshot commands: ${stats.contextSupersededCommands}`,
-    `context old tool results truncated: ${stats.contextTruncations}`,
-    `assistant thinking blocks dropped from old context: ${stats.thinkingBlocksDropped}`,
-    `auto compactions triggered: ${stats.compactionsTriggered}`,
-    `approx chars saved: ${stats.approxCharsSaved.toLocaleString()}`,
+    "",
+    "State",
+    `  pruning                  : ${enabled ? "on" : "off"}`,
+    `  ${usageLine}`,
+    `  seen output hashes       : ${fmtInt(seenOutputs.size)}`,
+    `  approx chars saved       : ${fmtInt(stats.approxCharsSaved)}`,
+    "",
+    "Persist-time pruning",
+    `  tool results seen        : ${fmtInt(stats.toolResultsSeen)}`,
+    `  exact duplicates         : ${fmtInt(stats.toolResultsDeduped)}`,
+    `  append-pruned            : ${fmtInt(stats.toolResultsAppendPruned)}`,
+    `  oversized truncated      : ${fmtInt(stats.toolResultsTruncated)}`,
+    "",
+    "Context-time pruning",
+    `  context passes           : ${fmtInt(stats.contextPasses)}`,
+    `  stale reads              : ${fmtInt(stats.contextStaleReads)}`,
+    `  exact duplicates         : ${fmtInt(stats.contextDuplicates)}`,
+    `  append/contained repeats : ${fmtInt(stats.contextAppendPruned)}`,
+    `  superseded commands      : ${fmtInt(stats.contextSupersededCommands)}`,
+    `  old results truncated    : ${fmtInt(stats.contextTruncations)}`,
+    `  thinking blocks dropped  : ${fmtInt(stats.thinkingBlocksDropped)}`,
+    `  auto compactions         : ${fmtInt(stats.compactionsTriggered)}`,
   ].join("\n");
 }
 

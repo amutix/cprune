@@ -36,6 +36,6 @@ off           Disable pruning
 compact       Trigger cprune-focused compaction
 ```
 
-`/cprune context-stat` and `cprune_status action="context-stat"` work whether pruning is on or off, so you can compare estimated savings before enabling it.
+`/cprune context-stat` and `cprune_status action="context-stat"` work whether pruning is on or off, so you can compare estimated savings before enabling it. The output includes grouped sections and terminal bar charts for raw vs pruned context plus per-rule hit counts.
 
 Note: turning pruning off prevents future pruning. It does not reconstruct tool outputs that were already pruned before persistence.
