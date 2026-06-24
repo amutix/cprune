@@ -749,6 +749,60 @@ function contextSize(messages: AnyMessage[]) {
   };
 }
 
+type Breakdown = Record<string, number>;
+
+function addBreakdown(target: Breakdown, label: string, chars: number) {
+  if (chars <= 0) return;
+  target[label] = (target[label] ?? 0) + chars;
+}
+
+function contextBreakdown(messages: AnyMessage[]): Breakdown {
+  const result: Breakdown = {};
+
+  for (const message of messages) {
+    if (!message) continue;
+
+    if (message.role === "assistant" && Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block?.type === "text") addBreakdown(result, "assistant text", String(block.text ?? "").length);
+        else if (block?.type === "thinking") addBreakdown(result, "assistant thinking", String(block.thinking ?? "").length);
+        else if (block?.type === "toolCall") addBreakdown(result, "tool calls", safeJson(block, 50_000).length);
+        else addBreakdown(result, "assistant other", safeJson(block, 50_000).length);
+      }
+      continue;
+    }
+
+    if (message.role === "toolResult") {
+      addBreakdown(result, "tool results", roughMessageChars(message));
+      continue;
+    }
+
+    if (message.role === "user") {
+      addBreakdown(result, "user messages", roughMessageChars(message));
+      continue;
+    }
+
+    if (message.role === "custom") {
+      addBreakdown(result, "custom messages", roughMessageChars(message));
+      continue;
+    }
+
+    if (message.role === "compactionSummary" || message.role === "branchSummary") {
+      addBreakdown(result, "summaries", roughMessageChars(message));
+      continue;
+    }
+
+    if (message.role === "bashExecution") {
+      addBreakdown(result, "bash executions", roughMessageChars(message));
+      continue;
+    }
+
+    addBreakdown(result, "other", roughMessageChars(message));
+  }
+
+  return result;
+}
+
 function currentContextMessages(ctx: any): AnyMessage[] {
   const built = ctx.sessionManager?.buildSessionContext?.();
   if (Array.isArray(built?.messages)) return built.messages;
@@ -781,6 +835,44 @@ function bar(value: number, max: number, width = 32): string {
   if (max <= 0) return "░".repeat(width);
   const filled = Math.max(0, Math.min(width, Math.round((value / max) * width)));
   return `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
+}
+
+function colorBar(value: number, max: number, kind: "before" | "after", width = 24): string {
+  if (max <= 0) return "·".repeat(width);
+  const filled = Math.max(0, Math.min(width, Math.round((value / max) * width)));
+  const fill = kind === "before" ? "🟧" : "🟩";
+  return `${fill.repeat(filled)}${"·".repeat(width - filled)}`;
+}
+
+function breakdownLines(before: Breakdown, after: Breakdown): string[] {
+  const labels = [
+    "tool results",
+    "assistant thinking",
+    "assistant text",
+    "tool calls",
+    "custom messages",
+    "user messages",
+    "summaries",
+    "bash executions",
+    "assistant other",
+    "other",
+  ];
+  const present = labels.filter((label) => (before[label] ?? 0) > 0 || (after[label] ?? 0) > 0);
+  const dynamic = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .filter((label) => !labels.includes(label))
+    .sort();
+  const ordered = [...present, ...dynamic];
+  const max = Math.max(1, ...ordered.map((label) => Math.max(before[label] ?? 0, after[label] ?? 0)));
+
+  return ordered.flatMap((label) => {
+    const b = before[label] ?? 0;
+    const a = after[label] ?? 0;
+    const saved = Math.max(0, b - a);
+    return [
+      `  ${label.padEnd(20)} before ${colorBar(b, max, "before", 12)} ${fmtInt(b).padStart(10)} chars`,
+      `  ${"".padEnd(20)} after  ${colorBar(a, max, "after", 12)} ${fmtInt(a).padStart(10)} chars  saved ${fmtInt(saved)}`,
+    ];
+  });
 }
 
 function countBar(label: string, value: number, max: number): string {
@@ -816,11 +908,17 @@ function simulatePrunedContext(ctx: any) {
   };
   restoreStats(snapshot);
 
-  return { before, after: contextSize(prunedMessages), passDelta };
+  return {
+    before,
+    after: contextSize(prunedMessages),
+    beforeBreakdown: contextBreakdown(rawMessages),
+    afterBreakdown: contextBreakdown(prunedMessages),
+    passDelta,
+  };
 }
 
 function contextStatText(ctx: any): string {
-  const { before, after, passDelta } = simulatePrunedContext(ctx);
+  const { before, after, beforeBreakdown, afterBreakdown, passDelta } = simulatePrunedContext(ctx);
   const savedChars = Math.max(0, before.chars - after.chars);
   const savedPct = before.chars > 0 ? (savedChars / before.chars) * 100 : 0;
   const usage = ctx.getContextUsage?.();
@@ -851,10 +949,12 @@ function contextStatText(ctx: any): string {
     `  messages          : ${fmtInt(before.messages)} total, ${fmtInt(passDelta.touched)} touched`,
     `  estimated savings : ${fmtInt(savedChars)} chars (~${fmtInt(Math.ceil(savedChars / 4))} tokens, ${fmtPct(savedPct)})`,
     "",
-    "Before / after",
-    `  raw      ${bar(before.chars, before.chars)} ${fmtInt(before.chars)} chars  ~${fmtInt(before.approxTokens)} tok  ${fmtPct(rawPct)}`,
-    `  cprune   ${bar(after.chars, before.chars)} ${fmtInt(after.chars)} chars  ~${fmtInt(after.approxTokens)} tok  ${fmtPct(afterPct)}`,
-    `  saved    ${bar(savedChars, before.chars)} ${fmtInt(savedChars)} chars  ~${fmtInt(Math.ceil(savedChars / 4))} tok  ${fmtPct(savedPct)}`,
+    "Total before / after",
+    `  before ${colorBar(before.chars, before.chars, "before")} ${fmtInt(before.chars)} chars  ~${fmtInt(before.approxTokens)} tok  ${fmtPct(rawPct)}`,
+    `  after  ${colorBar(after.chars, before.chars, "after")} ${fmtInt(after.chars)} chars  ~${fmtInt(after.approxTokens)} tok  ${fmtPct(afterPct)}`,
+    "",
+    "Breakdown by context part",
+    ...breakdownLines(beforeBreakdown, afterBreakdown),
     "",
     "Rule hits in this simulation",
     `  ${countBar("old thinking blocks", passDelta.thinkingBlocks, maxRuleCount)}`,
