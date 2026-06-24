@@ -14,6 +14,17 @@ type SeenOutput = {
   firstSeenAt: number;
   count: number;
   chars: number;
+  normalizedHash?: string;
+  normalizedChars?: number;
+  normalizedLineCount?: number;
+};
+
+type OutputFingerprint = SeenOutput & { index?: number };
+
+type AppendMatch = {
+  prior: OutputFingerprint;
+  boundary: number;
+  kind: "exact-prefix" | "normalized-prefix";
 };
 
 type CpruneStats = {
@@ -80,6 +91,45 @@ function shortHash(hash: string): string {
   return hash.slice(0, 16);
 }
 
+function stripAnsi(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function normalizedLinesForAppend(text: string): string[] {
+  const lines = stripAnsi(text)
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd());
+
+  // Treat a final newline as a line terminator, not as meaningful empty content.
+  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+function appendFingerprint(text: string) {
+  const lines = normalizedLinesForAppend(text);
+  const normalizedText = lines.join("\n");
+  return {
+    normalizedText,
+    normalizedHash: hashText(normalizedText),
+    normalizedChars: normalizedText.length,
+    normalizedLineCount: lines.length,
+  };
+}
+
+function rawBoundaryAfterNormalizedLines(text: string, lineCount: number): number {
+  if (lineCount <= 0) return 0;
+  let seenNewlines = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "\n") {
+      seenNewlines++;
+      if (seenNewlines === lineCount) return i + 1;
+    }
+  }
+  return text.length;
+}
+
 function safeJson(value: unknown, max = 220): string {
   let text: string;
   try {
@@ -121,13 +171,14 @@ function mergeStats(saved: number) {
   if (saved > 0) stats.approxCharsSaved += saved;
 }
 
-function rememberOutput(hash: string, toolName: string, input: unknown, chars: number): SeenOutput | undefined {
+function rememberOutput(hash: string, toolName: string, input: unknown, chars: number, text?: string): SeenOutput | undefined {
   const existing = seenOutputs.get(hash);
   if (existing) {
     existing.count++;
     return existing;
   }
 
+  const fp = text ? appendFingerprint(text) : undefined;
   seenOutputs.set(hash, {
     hash,
     toolName,
@@ -135,6 +186,9 @@ function rememberOutput(hash: string, toolName: string, input: unknown, chars: n
     firstSeenAt: Date.now(),
     count: 1,
     chars,
+    normalizedHash: fp?.normalizedHash,
+    normalizedChars: fp?.normalizedChars,
+    normalizedLineCount: fp?.normalizedLineCount,
   });
 
   while (seenOutputs.size > config.maxSeenHashes) {
@@ -146,10 +200,9 @@ function rememberOutput(hash: string, toolName: string, input: unknown, chars: n
   return undefined;
 }
 
-function findAppendedSeenOutput(text: string, toolName: string): SeenOutput | undefined {
-  // Detect "same output with new info appended" without storing the old full text:
-  // if sha256(newText.slice(0, oldLength)) === oldFullHash, the old output is an exact prefix.
-  const candidates = [...seenOutputs.values()]
+function findAppendedOutput(text: string, toolName: string, candidates: OutputFingerprint[]): AppendMatch | undefined {
+  // First pass: exact byte prefix. This is the safest and catches pure append-only growth.
+  const exactCandidates = candidates
     .filter(
       (seen) =>
         seen.toolName === toolName &&
@@ -158,28 +211,56 @@ function findAppendedSeenOutput(text: string, toolName: string): SeenOutput | un
     )
     .sort((a, b) => b.chars - a.chars);
 
-  for (const seen of candidates) {
-    if (hashText(text.slice(0, seen.chars)) === seen.hash) return seen;
+  for (const seen of exactCandidates) {
+    if (hashText(text.slice(0, seen.chars)) === seen.hash) {
+      return { prior: seen, boundary: seen.chars, kind: "exact-prefix" };
+    }
+  }
+
+  // Second pass: normalized line-prefix. This catches append-only output where ANSI escapes,
+  // CRLF/LF, or trailing whitespace differ, while still requiring the old content to be a prefix.
+  const currentFp = appendFingerprint(text);
+  const normalizedCandidates = candidates
+    .filter(
+      (seen) =>
+        seen.toolName === toolName &&
+        (seen.normalizedChars ?? 0) >= config.minAppendPrefixChars &&
+        (seen.normalizedChars ?? 0) < currentFp.normalizedChars &&
+        (seen.normalizedLineCount ?? 0) > 0 &&
+        (seen.normalizedLineCount ?? 0) < currentFp.normalizedLineCount,
+    )
+    .sort((a, b) => (b.normalizedChars ?? 0) - (a.normalizedChars ?? 0));
+
+  for (const seen of normalizedCandidates) {
+    const normalizedChars = seen.normalizedChars ?? 0;
+    if (hashText(currentFp.normalizedText.slice(0, normalizedChars)) === seen.normalizedHash) {
+      return {
+        prior: seen,
+        boundary: rawBoundaryAfterNormalizedLines(text, seen.normalizedLineCount ?? 0),
+        kind: "normalized-prefix",
+      };
+    }
   }
 
   return undefined;
 }
 
-function appendedReplacement(
-  text: string,
-  toolName: string,
-  prior: Pick<SeenOutput, "hash" | "chars" | "input"> & { index?: number },
-): { text: string; saved: number } {
-  const suffix = text.slice(prior.chars);
+function findAppendedSeenOutput(text: string, toolName: string): AppendMatch | undefined {
+  return findAppendedOutput(text, toolName, [...seenOutputs.values()]);
+}
+
+function appendedReplacement(text: string, toolName: string, match: AppendMatch): { text: string; saved: number } {
+  const omittedChars = Math.min(match.boundary, text.length);
+  const suffix = text.slice(omittedChars);
   const suffixTrimmed = truncateMiddle(suffix, config.maxAppendedSuffixChars, `newly appended ${toolName} output`);
   const header =
-    prior.index === undefined
-      ? `[cprune: omitted ${prior.chars} repeated prefix chars from ${toolName} result; prefix hash=${shortHash(prior.hash)}; first input=${prior.input}. Newly appended output follows.]\n`
-      : `[cprune: omitted ${prior.chars} repeated prefix chars from ${toolName} result; same prefix appeared at message index ${prior.index}; prefix hash=${shortHash(prior.hash)}. Newly appended output follows.]\n`;
+    match.prior.index === undefined
+      ? `[cprune: omitted ${omittedChars} repeated prefix chars from ${toolName} result; match=${match.kind}; prefix hash=${shortHash(match.prior.hash)}; first input=${match.prior.input}. Newly appended output follows.]\n`
+      : `[cprune: omitted ${omittedChars} repeated prefix chars from ${toolName} result; match=${match.kind}; same prefix appeared at message index ${match.prior.index}; prefix hash=${shortHash(match.prior.hash)}. Newly appended output follows.]\n`;
 
   return {
     text: `${header}${suffixTrimmed.text}`,
-    saved: Math.max(0, prior.chars - header.length) + suffixTrimmed.saved,
+    saved: Math.max(0, omittedChars - header.length) + suffixTrimmed.saved,
   };
 }
 
@@ -302,7 +383,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
     }
   });
 
-  const contextFingerprints: Array<{ hash: string; index: number; toolName: string; chars: number }> = [];
+  const contextFingerprints: OutputFingerprint[] = [];
   let touched = 0;
 
   return messages.map((message, index) => {
@@ -360,31 +441,41 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
         );
       }
 
-      const appended = contextFingerprints
-        .filter(
-          (fp) =>
-            fp.toolName === toolName &&
-            fp.chars >= config.minAppendPrefixChars &&
-            fp.chars < fullText.length,
-        )
-        .sort((a, b) => b.chars - a.chars)
-        .find((fp) => hashText(fullText.slice(0, fp.chars)) === fp.hash);
+      const appended = findAppendedOutput(fullText, toolName, contextFingerprints);
+      const fp = appendFingerprint(fullText);
 
       if (appended) {
-        const replacement = appendedReplacement(fullText, toolName, {
-          hash: appended.hash,
-          chars: appended.chars,
-          input: "context",
-          index: appended.index,
-        });
+        const replacement = appendedReplacement(fullText, toolName, appended);
         stats.contextAppendPruned++;
         touched++;
         mergeStats(replacement.saved);
-        contextFingerprints.push({ hash, index, toolName, chars: fullText.length });
+        contextFingerprints.push({
+          hash,
+          index,
+          toolName,
+          input: "context",
+          firstSeenAt: Date.now(),
+          count: 1,
+          chars: fullText.length,
+          normalizedHash: fp.normalizedHash,
+          normalizedChars: fp.normalizedChars,
+          normalizedLineCount: fp.normalizedLineCount,
+        });
         return cloneWithText(current, replacement.text);
       }
 
-      contextFingerprints.push({ hash, index, toolName, chars: fullText.length });
+      contextFingerprints.push({
+        hash,
+        index,
+        toolName,
+        input: "context",
+        firstSeenAt: Date.now(),
+        count: 1,
+        chars: fullText.length,
+        normalizedHash: fp.normalizedHash,
+        normalizedChars: fp.normalizedChars,
+        normalizedLineCount: fp.normalizedLineCount,
+      });
     }
 
     // Oversized old tool outputs.
@@ -600,7 +691,7 @@ export default function cprune(pi: ExtensionAPI) {
       }
 
       const appended = findAppendedSeenOutput(fullText, event.toolName);
-      rememberOutput(hash, event.toolName, event.input, fullText.length);
+      rememberOutput(hash, event.toolName, event.input, fullText.length, fullText);
       if (appended) {
         stats.toolResultsAppendPruned++;
         const replacement = appendedReplacement(fullText, event.toolName, appended);
@@ -611,8 +702,9 @@ export default function cprune(pi: ExtensionAPI) {
             ...(typeof event.details === "object" && event.details ? event.details : {}),
             cprune: {
               pruned: "appended",
-              prefixHash: appended.hash,
-              omittedPrefixChars: appended.chars,
+              match: appended.kind,
+              prefixHash: appended.prior.hash,
+              omittedPrefixChars: appended.boundary,
               originalChars: fullText.length,
             },
           },

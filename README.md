@@ -2,6 +2,8 @@
 
 Context pruning extension for Pi. It reduces duplicate, append-only, stale, and oversized context before model calls, and can optionally trigger focused compaction.
 
+Append-only pruning detects both exact byte prefixes and normalized line-prefixes, so it can catch repeated output with new lines appended even when ANSI escapes, CRLF/LF, or trailing whitespace differ.
+
 ## Use
 
 From this directory:
