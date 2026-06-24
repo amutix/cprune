@@ -38,6 +38,6 @@ off           Disable pruning
 compact       Trigger cprune-focused compaction
 ```
 
-`/cprune stats` and `cprune_status action="stats"` work whether pruning is on or off, so you can compare estimated savings before enabling it. (`stat` and the old `context-stat` action are accepted as aliases.) The output includes grouped sections, ANSI-colored orange before / green after continuous bars, before/after breakdown by context part, per-rule hit counts, and per-rule character savings.
+`/cprune stats` and `cprune_status action="stats"` work whether pruning is on or off, so you can compare estimated savings before enabling it. (`stat` and the old `context-stat` action are accepted as aliases.) The output includes grouped sections, TUI-safe continuous bars, before/after breakdown by context part, per-rule hit counts, and per-rule character savings.
 
 Note: turning pruning off prevents future pruning. It does not reconstruct tool outputs that were already pruned before persistence.

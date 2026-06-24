@@ -1158,11 +1158,12 @@ function bar(value: number, max: number, width = 32): string {
   return `${filled}${padding}`;
 }
 
-function colorBar(value: number, max: number, kind: "before" | "after", width = 24): string {
+function colorBar(value: number, max: number, _kind: "before" | "after", width = 24): string {
+  // Do not emit raw ANSI escape codes from extension messages. Pi renders these
+  // strings inside its own TUI; control sequences can leak into layout/log output
+  // in some terminals. Keep bars continuous but plain-text safe.
   const { filled, padding } = blockBar(value, max, width);
-  const color = kind === "before" ? "\x1b[38;5;208m" : "\x1b[32m";
-  const reset = "\x1b[0m";
-  return filled ? `${color}${filled}${reset}${padding}` : padding;
+  return `${filled}${padding}`;
 }
 
 function breakdownLines(before: Breakdown, after: Breakdown): string[] {
