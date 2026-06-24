@@ -47,6 +47,7 @@ type CpruneStats = {
   contextToolCallArgsPruned: number;
   contextToolCallsCompacted: number;
   contextTruncations: number;
+  manualContextOmissions: number;
   thinkingBlocksDropped: number;
   approxCharsSaved: number;
   savedThinkingChars: number;
@@ -60,6 +61,7 @@ type CpruneStats = {
   savedEntityChars: number;
   savedToolCallArgChars: number;
   savedTruncationChars: number;
+  savedManualOmissionChars: number;
   entityFamilyPruned: Record<string, number>;
   entityFamilySavedChars: Record<string, number>;
   compactionsTriggered: number;
@@ -88,6 +90,7 @@ const config = {
   minRepeatedChunkLines: 24,
   minRepeatedChunkChars: 1_200,
   maxSeenHashes: 300,
+  maxReviewCandidates: 20,
 
   // Background compaction trigger. Set to 0 to disable.
   autoCompactAtPercent: 82,
@@ -113,6 +116,7 @@ const stats: CpruneStats = {
   contextToolCallArgsPruned: 0,
   contextToolCallsCompacted: 0,
   contextTruncations: 0,
+  manualContextOmissions: 0,
   thinkingBlocksDropped: 0,
   approxCharsSaved: 0,
   savedThinkingChars: 0,
@@ -126,12 +130,23 @@ const stats: CpruneStats = {
   savedEntityChars: 0,
   savedToolCallArgChars: 0,
   savedTruncationChars: 0,
+  savedManualOmissionChars: 0,
   entityFamilyPruned: {},
   entityFamilySavedChars: {},
   compactionsTriggered: 0,
 };
 
+type ManualOmission = {
+  hash: string;
+  label: string;
+  role: string;
+  chars: number;
+  preview: string;
+  createdAt: number;
+};
+
 const seenOutputs = new Map<string, SeenOutput>();
+const manualOmissions = new Map<string, ManualOmission>();
 let lastCompactAt = 0;
 let compactInFlight = false;
 let enabled = true;
@@ -626,6 +641,13 @@ function loadStateFromSession(ctx: any) {
       if (item?.hash) seenOutputs.set(item.hash, item);
     }
   }
+
+  if (Array.isArray(stateEntry.data.manualOmissions)) {
+    manualOmissions.clear();
+    for (const item of stateEntry.data.manualOmissions) {
+      if (item?.hash) manualOmissions.set(item.hash, item);
+    }
+  }
 }
 
 function saveState(pi: ExtensionAPI) {
@@ -634,6 +656,7 @@ function saveState(pi: ExtensionAPI) {
     enabled,
     lastCompactAt,
     seenOutputs: [...seenOutputs.values()].slice(-config.maxSeenHashes),
+    manualOmissions: [...manualOmissions.values()],
     savedAt: Date.now(),
   });
 }
@@ -663,6 +686,12 @@ function normalizePath(value: unknown): string | undefined {
 }
 
 function cloneWithText(message: AnyMessage, text: string): AnyMessage {
+  if (message?.role === "compactionSummary" || message?.role === "branchSummary") {
+    return { ...message, summary: text };
+  }
+  if (message?.role === "bashExecution") {
+    return { ...message, output: text };
+  }
   return {
     ...message,
     content: textContent(text),
@@ -930,6 +959,16 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
   return messages.map((message, index) => {
     // Keep the very recent tail pristine so active tool-use protocol stays high fidelity.
     if (index >= recentStart) return message;
+
+    const manual = isSafeManualOmissionCandidate(message) ? manualOmissions.get(messageOmissionHash(message)) : undefined;
+    if (manual) {
+      const replacement = manualOmissionReplacement(manual);
+      const saved = Math.max(0, roughMessageChars(message) - replacement.length);
+      stats.manualContextOmissions++;
+      recordSavings(saved, "savedManualOmissionChars");
+      touched++;
+      return cloneWithText(message, replacement);
+    }
 
     let current = message;
 
@@ -1227,6 +1266,41 @@ function roughMessageChars(message: AnyMessage): number {
   return safeJson(message, 50_000).length;
 }
 
+function stableMessageText(message: AnyMessage): string {
+  if (!message) return "";
+  if (message.role === "assistant" && Array.isArray(message.content)) {
+    return message.content
+      .map((block: any) => {
+        if (block?.type === "text") return block.text ?? "";
+        if (block?.type === "thinking") return block.thinking ?? "";
+        if (block?.type === "toolCall") return safeJson(block, 20_000);
+        return safeJson(block, 20_000);
+      })
+      .join("\n");
+  }
+  if (message.role === "compactionSummary" || message.role === "branchSummary") return String(message.summary ?? "");
+  if (message.role === "bashExecution") return `${message.command ?? ""}\n${message.output ?? ""}`;
+  return textFromContent(message.content) || safeJson(message, 50_000);
+}
+
+function messageOmissionHash(message: AnyMessage): string {
+  return hashText(`${message?.role ?? "unknown"}\n${stableMessageText(message)}`);
+}
+
+function messageLabel(message: AnyMessage, index: number): string {
+  if (message?.role === "toolResult") return `#${index} tool result`;
+  if (message?.role === "assistant") return `#${index} assistant`;
+  if (message?.role === "user") return `#${index} user`;
+  if (message?.role === "custom") return `#${index} custom:${message.customType ?? "message"}`;
+  if (message?.role === "compactionSummary") return `#${index} compaction summary`;
+  if (message?.role === "branchSummary") return `#${index} branch summary`;
+  return `#${index} ${message?.role ?? "message"}`;
+}
+
+function manualOmissionReplacement(omission: ManualOmission): string {
+  return `[cprune: user-excluded context omitted; label=${omission.label}; hash=${shortHash(omission.hash)}; original=${omission.chars} chars; preview=${JSON.stringify(omission.preview)}.]`;
+}
+
 function contextSize(messages: AnyMessage[]) {
   const chars = messages.reduce((sum, message) => sum + roughMessageChars(message), 0);
   return {
@@ -1428,6 +1502,7 @@ function simulatePrunedContext(ctx: any) {
     entities: stats.contextEntityPruned - snapshot.contextEntityPruned,
     toolCallArgs: stats.contextToolCallArgsPruned - snapshot.contextToolCallArgsPruned,
     truncations: stats.contextTruncations - snapshot.contextTruncations,
+    manualOmissions: stats.manualContextOmissions - snapshot.manualContextOmissions,
     thinkingBlocks: stats.thinkingBlocksDropped - snapshot.thinkingBlocksDropped,
     touched: stats.contextMessagesTouched - snapshot.contextMessagesTouched,
     saved: stats.approxCharsSaved - snapshot.approxCharsSaved,
@@ -1442,6 +1517,7 @@ function simulatePrunedContext(ctx: any) {
     savedEntities: stats.savedEntityChars - snapshot.savedEntityChars,
     savedToolCallArgs: stats.savedToolCallArgChars - snapshot.savedToolCallArgChars,
     savedTruncations: stats.savedTruncationChars - snapshot.savedTruncationChars,
+    savedManualOmissions: stats.savedManualOmissionChars - snapshot.savedManualOmissionChars,
     entityFamilyPruned: diffRecord(stats.entityFamilyPruned, snapshot.entityFamilyPruned),
     entityFamilySavedChars: diffRecord(stats.entityFamilySavedChars, snapshot.entityFamilySavedChars),
   };
@@ -1477,6 +1553,7 @@ function contextStatText(ctx: any): string {
     passDelta.entities,
     passDelta.toolCallArgs,
     passDelta.truncations,
+    passDelta.manualOmissions,
     passDelta.thinkingBlocks,
   );
   const rawPct = before.chars > 0 ? 100 : 0;
@@ -1509,6 +1586,7 @@ function contextStatText(ctx: any): string {
     `  ${countBar("superseded snapshot commands", passDelta.supersededCommands, maxRuleCount)}`,
     `  ${countBar("superseded tool results", passDelta.supersededToolResults, maxRuleCount)}`,
     `  ${countBar("oversized old results", passDelta.truncations, maxRuleCount)}`,
+    `  ${countBar("user-excluded entries", passDelta.manualOmissions, maxRuleCount)}`,
     `  ${countBar("exact duplicates", passDelta.duplicates, maxRuleCount)}`,
     ...entityFamilyLines(passDelta.entityFamilyPruned, passDelta.entityFamilySavedChars),
     "",
@@ -1523,6 +1601,7 @@ function contextStatText(ctx: any): string {
     `  ${countBar("truncation chars", passDelta.savedTruncations, Math.max(1, passDelta.saved))}`,
     `  ${countBar("superseded cmd chars", passDelta.savedSupersededCommands, Math.max(1, passDelta.saved))}`,
     `  ${countBar("superseded tool chars", passDelta.savedSupersededToolResults, Math.max(1, passDelta.saved))}`,
+    `  ${countBar("manual omit chars", passDelta.savedManualOmissions, Math.max(1, passDelta.saved))}`,
     `  ${countBar("duplicate chars", passDelta.savedDuplicates, Math.max(1, passDelta.saved))}`,
     "",
     `Rule-estimated saved chars: ${fmtInt(passDelta.saved)}`,
@@ -1542,6 +1621,7 @@ function statusText(ctx?: any): string {
     `  pruning                  : ${enabled ? "on" : "off"}`,
     `  ${usageLine}`,
     `  seen output hashes       : ${fmtInt(seenOutputs.size)}`,
+    `  user exclusions          : ${fmtInt(manualOmissions.size)}`,
     `  approx chars saved       : ${fmtInt(stats.approxCharsSaved)}`,
     "",
     "Persist-time pruning",
@@ -1564,6 +1644,7 @@ function statusText(ctx?: any): string {
     `  superseded commands      : ${fmtInt(stats.contextSupersededCommands)}`,
     `  superseded tool results  : ${fmtInt(stats.contextSupersededToolResults)}`,
     `  old results truncated    : ${fmtInt(stats.contextTruncations)}`,
+    `  user-excluded entries    : ${fmtInt(stats.manualContextOmissions)}`,
     `  thinking blocks dropped  : ${fmtInt(stats.thinkingBlocksDropped)}`,
     `  auto compactions         : ${fmtInt(stats.compactionsTriggered)}`,
     "",
@@ -1579,8 +1660,92 @@ function statusText(ctx?: any): string {
     `  entities                  : ${fmtInt(stats.savedEntityChars)} chars`,
     `  tool-call args            : ${fmtInt(stats.savedToolCallArgChars)} chars`,
     `  truncation                : ${fmtInt(stats.savedTruncationChars)} chars`,
+    `  user exclusions           : ${fmtInt(stats.savedManualOmissionChars)} chars`,
     ...entityFamilyLines(stats.entityFamilyPruned, stats.entityFamilySavedChars),
   ].join("\n");
+}
+
+type ReviewCandidate = {
+  index: number;
+  hash: string;
+  label: string;
+  role: string;
+  chars: number;
+  ids: string[];
+  preview: string;
+};
+
+function isSafeManualOmissionCandidate(message: AnyMessage): boolean {
+  // Avoid user-directed omission of historical assistant tool-call containers: some
+  // providers expect old tool results to remain paired with their tool-call blocks.
+  // cprune can still compact their large arguments with protocol-aware rules.
+  return !(message?.role === "assistant" && Array.isArray(message.content) && message.content.some((block: any) => block?.type === "toolCall"));
+}
+
+function largeContextCandidates(ctx: any): ReviewCandidate[] {
+  const messages = currentContextMessages(ctx);
+  const recentStart = Math.max(0, messages.length - config.keepRecentMessagesUntouched);
+  return messages
+    .map((message, index): ReviewCandidate | undefined => {
+      if (index >= recentStart) return undefined;
+      if (!isSafeManualOmissionCandidate(message)) return undefined;
+      const text = stableMessageText(message);
+      const chars = roughMessageChars(message);
+      if (chars < 800 || !text.trim()) return undefined;
+      const hash = messageOmissionHash(message);
+      if (manualOmissions.has(hash)) return undefined;
+      return {
+        index,
+        hash,
+        label: messageLabel(message, index),
+        role: String(message?.role ?? "message"),
+        chars,
+        ids: extractEntityIds(text),
+        preview: previewEntityText(text, 180),
+      };
+    })
+    .filter((item): item is ReviewCandidate => Boolean(item))
+    .sort((a, b) => b.chars - a.chars)
+    .slice(0, config.maxReviewCandidates);
+}
+
+function reviewCandidateOption(candidate: ReviewCandidate): string {
+  const ids = candidate.ids.length ? ` ${candidate.ids.slice(0, 4).join(",")}` : "";
+  return `${fmtInt(candidate.chars).padStart(8)} chars | ${candidate.label}${ids} | ${candidate.preview.replace(/\s+/g, " ").slice(0, 90)}`;
+}
+
+async function reviewLargeContext(ctx: any, pi: ExtensionAPI) {
+  const candidates = largeContextCandidates(ctx);
+  if (candidates.length === 0) {
+    ctx.ui.notify("cprune: no large older context candidates found", "info");
+    return;
+  }
+
+  const options = candidates.map(reviewCandidateOption);
+  options.push("Cancel");
+  const choice = await ctx.ui.select("cprune: choose an older context entry to exclude from future model prompts", options);
+  if (!choice || choice === "Cancel") return;
+
+  const index = options.indexOf(choice);
+  const candidate = candidates[index];
+  if (!candidate) return;
+
+  const ok = await ctx.ui.confirm(
+    "Exclude from future prompts?",
+    `${candidate.label}\n${fmtInt(candidate.chars)} chars\n\nThis is non-destructive: cprune will omit this entry at prompt time, but it will not rewrite Pi session history.`,
+  );
+  if (!ok) return;
+
+  manualOmissions.set(candidate.hash, {
+    hash: candidate.hash,
+    label: candidate.label,
+    role: candidate.role,
+    chars: candidate.chars,
+    preview: candidate.preview,
+    createdAt: Date.now(),
+  });
+  saveState(pi);
+  ctx.ui.notify(`cprune: excluded ${candidate.label} from future prompts`, "info");
 }
 
 function cpruneCompactInstructions(reason: string): string {
@@ -1725,7 +1890,7 @@ export default function cprune(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cprune", {
-    description: "Control cprune: /cprune on|off|status|stats|compact",
+    description: "Control cprune: /cprune on|off|status|stats|review|compact",
     handler: async (args, ctx) => {
       const action = args.trim() || "status";
 
@@ -1755,6 +1920,19 @@ export default function cprune(pi: ExtensionAPI) {
         return;
       }
 
+      if (action === "review") {
+        await reviewLargeContext(ctx, pi);
+        return;
+      }
+
+      if (action === "clear-exclusions") {
+        const count = manualOmissions.size;
+        manualOmissions.clear();
+        saveState(pi);
+        ctx.ui.notify(`cprune: cleared ${count} user exclusions`, "info");
+        return;
+      }
+
       if (action === "compact") {
         ctx.compact({
           customInstructions: cpruneCompactInstructions("manual compaction"),
@@ -1763,7 +1941,7 @@ export default function cprune(pi: ExtensionAPI) {
         });
         return;
       }
-      ctx.ui.notify("Usage: /cprune [on|off|status|stats|compact]", "warning");
+      ctx.ui.notify("Usage: /cprune [on|off|status|stats|review|clear-exclusions|compact]", "warning");
     },
   });
 

@@ -11,7 +11,7 @@ Entity-aware pruning is generic rather than tied to one extension: it detects ID
 cprune has two pruning points:
 
 - **Persist-time pruning** runs on new tool results before Pi stores them. This is intentionally conservative and limited to mechanical cases: exact duplicates, normalized duplicates where only ANSI/CRLF/trailing whitespace differ, append/prefix repeats, and oversized tool results with hash/original-size metadata plus retained head/tail preview.
-- **Prompt-time pruning** runs before a model request. It is non-destructive to Pi's active session files, but can be more aggressive because it only changes the context sent to the model for that request.
+- **Prompt-time pruning** runs before a model request. It is non-destructive to Pi's active session files, but can be more aggressive because it only changes the context sent to the model for that request. `/cprune review` adds explicit user-approved prompt-time exclusions for large older entries; these exclusions are persisted as cprune state, not by rewriting Pi history.
 
 cprune should not be described as fully lossless. Persist-time pruning is near-lossless but still replaces bytes in saved tool results for the safe cases above. Prompt-time pruning may replace older details with hashes, IDs, previews, and re-run hints. This reduces token use, but the model may no longer see every historical byte in the immediate request.
 
@@ -36,11 +36,13 @@ Or install/configure it as a Pi package; `package.json` exposes `src/cprune.ts` 
 ## Commands
 
 ```text
-/cprune status        Show cumulative pruning counters
-/cprune stats         Compare raw context vs simulated cprune-pruned context
-/cprune on            Enable pruning
-/cprune off           Disable pruning
-/cprune compact       Lossily compact/prune context via Pi compaction
+/cprune status             Show cumulative pruning counters
+/cprune stats              Compare raw context vs simulated cprune-pruned context
+/cprune review             Pick large older context entries to exclude from future prompts
+/cprune clear-exclusions   Clear user-approved prompt-time exclusions
+/cprune on                 Enable pruning
+/cprune off                Disable pruning
+/cprune compact            Lossily compact/prune context via Pi compaction
 ```
 
 ## Tool
@@ -55,6 +57,6 @@ off           Disable pruning
 compact       Lossily compact/prune context via Pi compaction
 ```
 
-`/cprune stats` and `cprune_status action="stats"` work whether pruning is on or off, so you can compare estimated savings before enabling it. (`stat` and the old `context-stat` action are accepted as aliases.) The output includes grouped sections, orange/green continuous bars, before/after breakdown by context part, per-rule hit counts, and per-rule character savings.
+`/cprune stats` and `cprune_status action="stats"` work whether pruning is on or off, so you can compare estimated savings before enabling it. (`stat` and the old `context-stat` action are accepted as aliases.) The output includes grouped sections, orange/green continuous bars, before/after breakdown by context part, per-rule hit counts, per-rule character savings, and any user-approved exclusions.
 
 Note: `/cprune compact` is intentionally named compact because it is lossy summarization. It does not rewrite Pi session JSONL files in place; it uses Pi's compaction API to append a normal compaction entry, which is safer for Pi's append-only session/tree model. Turning pruning off prevents future pruning; it does not reconstruct tool outputs that were already pruned before persistence.
