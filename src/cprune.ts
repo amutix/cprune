@@ -869,8 +869,8 @@ function breakdownLines(before: Breakdown, after: Breakdown): string[] {
     const a = after[label] ?? 0;
     const saved = Math.max(0, b - a);
     return [
-      `  ${label.padEnd(20)} before ${colorBar(b, max, "before", 12)} ${fmtInt(b).padStart(10)} chars`,
-      `  ${"".padEnd(20)} after  ${colorBar(a, max, "after", 12)} ${fmtInt(a).padStart(10)} chars  saved ${fmtInt(saved)}`,
+      `  ${label.padEnd(20)} ${colorBar(b, max, "before", 12)} ${fmtInt(b).padStart(10)} chars`,
+      `  ${"".padEnd(20)} ${colorBar(a, max, "after", 12)} ${fmtInt(a).padStart(10)} chars  saved ${fmtInt(saved)}`,
     ];
   });
 }
