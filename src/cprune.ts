@@ -39,10 +39,12 @@ type CpruneStats = {
   contextDuplicates: number;
   contextAppendPruned: number;
   contextSupersededCommands: number;
+  contextSupersededToolResults: number;
   contextChunkPruned: number;
   contextCustomMessagesPruned: number;
   contextEntityPruned: number;
   contextToolCallArgsPruned: number;
+  contextToolCallsCompacted: number;
   contextTruncations: number;
   thinkingBlocksDropped: number;
   approxCharsSaved: number;
@@ -51,6 +53,7 @@ type CpruneStats = {
   savedDuplicateChars: number;
   savedAppendChars: number;
   savedSupersededCommandChars: number;
+  savedSupersededToolResultChars: number;
   savedChunkChars: number;
   savedCustomChars: number;
   savedEntityChars: number;
@@ -78,6 +81,9 @@ const config = {
   minEntityPruneChars: 700,
   maxToolCallArgStringChars: 800,
   maxPriorityToolCallArgStringChars: 300,
+  minHistoricalToolCallArgChars: 500,
+  minStructuredNoticeChars: 160,
+  minSupersededToolResultChars: 500,
   minRepeatedChunkLines: 24,
   minRepeatedChunkChars: 1_200,
   maxSeenHashes: 300,
@@ -98,10 +104,12 @@ const stats: CpruneStats = {
   contextDuplicates: 0,
   contextAppendPruned: 0,
   contextSupersededCommands: 0,
+  contextSupersededToolResults: 0,
   contextChunkPruned: 0,
   contextCustomMessagesPruned: 0,
   contextEntityPruned: 0,
   contextToolCallArgsPruned: 0,
+  contextToolCallsCompacted: 0,
   contextTruncations: 0,
   thinkingBlocksDropped: 0,
   approxCharsSaved: 0,
@@ -110,6 +118,7 @@ const stats: CpruneStats = {
   savedDuplicateChars: 0,
   savedAppendChars: 0,
   savedSupersededCommandChars: 0,
+  savedSupersededToolResultChars: 0,
   savedChunkChars: 0,
   savedCustomChars: 0,
   savedEntityChars: 0,
@@ -268,6 +277,109 @@ function previewEntityText(text: string, maxChars = config.maxEntityPreviewChars
     .filter((line, index) => index < 2 || /\b(?:TASK|SPEC|DISC|ISSUE|BUG|PR|MR|EPIC|INIT|MILESTONE|REQ|DOC)-\d+\b/i.test(line));
   const preview = lines.slice(0, 8).join("\n").trim() || text.slice(0, maxChars);
   return truncateMiddle(preview, maxChars, "entity preview").text;
+}
+
+function uniqueSorted(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))].sort();
+}
+
+function extractPaths(value: unknown, depth = 0): string[] {
+  if (depth > 4 || value == null) return [];
+  if (typeof value === "string") {
+    const normalized = normalizePath(value);
+    if (!normalized) return [];
+    if (/[/\\]/.test(value) || /\.[a-z0-9]{1,8}$/i.test(value)) return [normalized];
+    return [];
+  }
+  if (Array.isArray(value)) return value.flatMap((item) => extractPaths(item, depth + 1));
+  if (typeof value === "object") {
+    return Object.entries(value as Record<string, unknown>).flatMap(([key, item]) => {
+      if (/path|file|dir|cwd/i.test(key) && typeof item === "string") return extractPaths(item, depth + 1);
+      return extractPaths(item, depth + 1);
+    });
+  }
+  return [];
+}
+
+function isCoreToolName(toolName: string): boolean {
+  return ["read", "bash", "edit", "write", "multi_tool_use.parallel"].includes(toolName);
+}
+
+function stripBoilerplateNoticeTails(text: string): { text: string; saved: number; stripped: boolean } {
+  const lines = text.split(/\r?\n/);
+  const kept = lines.filter((line) => {
+    const normalized = line.trim();
+    return !/^Run\s+\w+(?:_\w+)?\s+show\b.*(?:full|context|details|latest|current)/i.test(normalized)
+      && !/^Use\s+\w+(?:_\w+)?\s+show\b.*(?:full|context|details|latest|current)/i.test(normalized)
+      && !/^For\s+full\s+context,?\s+run\b/i.test(normalized);
+  });
+  const next = kept.join("\n");
+  return { text: next, saved: Math.max(0, text.length - next.length), stripped: next !== text };
+}
+
+function structuredNoticeEvent(text: string): string {
+  const firstLine = text.split(/\r?\n/, 1)[0]?.trim() ?? "notice";
+  const bracket = firstLine.match(/^\[([^:\]]+)(?::|\])/);
+  const event = text.match(/\b(assigned|unassigned|picked|started|blocked|unblocked|review|reviewed|done|completed|closed|created|updated|commented|mentioned|notified|notification)\b/i)?.[1];
+  return [bracket?.[1], event?.toLowerCase()].filter(Boolean).join("/") || "structured notice";
+}
+
+function pruneStructuredEntityNotice(
+  text: string,
+  label: string,
+  index: number,
+  latestEntityIndex: Map<string, number>,
+): { text: string; saved: number; pruned: boolean; strippedBoilerplate: boolean } {
+  const boilerplate = stripBoilerplateNoticeTails(text);
+  const working = boilerplate.text;
+  const ids = extractEntityIds(working);
+  const latest = ids.length ? Math.max(...ids.map((id) => latestEntityIndex.get(id) ?? index)) : index;
+  const looksStructured = /^\s*\[[a-z][^\]]{0,120}\]/i.test(working) || /\b(?:Run|Use)\s+\w+(?:_\w+)?\s+show\b/i.test(text);
+
+  if (ids.length > 0 && looksStructured && working.length >= config.minStructuredNoticeChars && latest > index) {
+    const hash = hashText(normalizeEntityText(working) || working);
+    const preview = previewEntityText(working, 260);
+    const replacement = `[cprune: older structured ${label} notice compacted; event=${structuredNoticeEvent(working)}; entities=${ids.join(",")}; newer mention appears at message index ${latest}; hash=${shortHash(hash)}; original=${text.length} chars.]\n${preview}`;
+    return {
+      text: replacement,
+      saved: Math.max(0, text.length - replacement.length),
+      pruned: true,
+      strippedBoilerplate: boilerplate.stripped,
+    };
+  }
+
+  if (boilerplate.stripped && boilerplate.saved > 0) {
+    return { text: working, saved: boilerplate.saved, pruned: true, strippedBoilerplate: true };
+  }
+
+  return { text, saved: 0, pruned: false, strippedBoilerplate: false };
+}
+
+function toolEntityIds(toolName: string, text: string, args: unknown): string[] {
+  if (isCoreToolName(toolName)) return [];
+  return uniqueSorted([...extractEntityIds(text), ...extractEntityIds(safeJson(args, 20_000))]);
+}
+
+function compactHistoricalToolCall(block: any): { block: any; saved: number; pruned: boolean } {
+  const args = block?.arguments ?? {};
+  const original = safeJson(args, 40_000);
+  if (original.length < config.minHistoricalToolCallArgChars) return { block, saved: 0, pruned: false };
+
+  const ids = extractEntityIds(original);
+  const paths = uniqueSorted(extractPaths(args)).slice(0, 8);
+  const replacementArgs: Record<string, unknown> = {
+    _cprune: "successful historical tool call arguments compacted",
+    hash: shortHash(hashText(original)),
+    originalChars: original.length,
+  };
+  if (ids.length > 0) replacementArgs.entities = ids;
+  if (paths.length > 0) replacementArgs.paths = paths;
+  replacementArgs.preview = truncateMiddle(original, 220, "tool call arg preview").text;
+
+  const replacementChars = safeJson(replacementArgs, 40_000).length;
+  const saved = original.length - replacementChars;
+  if (saved <= 0) return { block, saved: 0, pruned: false };
+  return { block: { ...block, arguments: replacementArgs }, saved, pruned: true };
 }
 
 function messageTextForEntities(message: AnyMessage): string {
@@ -609,9 +721,10 @@ function pruneAssistantContext(
   touched: boolean;
   entityPruned: number;
   toolArgsPruned: number;
+  toolCallsCompacted: number;
 } {
   if (message?.role !== "assistant" || !Array.isArray(message.content)) {
-    return { message, saved: 0, savedEntity: 0, savedToolArgs: 0, touched: false, entityPruned: 0, toolArgsPruned: 0 };
+    return { message, saved: 0, savedEntity: 0, savedToolArgs: 0, touched: false, entityPruned: 0, toolArgsPruned: 0, toolCallsCompacted: 0 };
   }
 
   let saved = 0;
@@ -620,6 +733,7 @@ function pruneAssistantContext(
   let touched = false;
   let entityPruned = 0;
   let toolArgsPruned = 0;
+  let toolCallsCompacted = 0;
 
   const content = message.content.map((block: any) => {
     if (block?.type === "text" && typeof block.text === "string") {
@@ -636,6 +750,16 @@ function pruneAssistantContext(
     }
 
     if (block?.type === "toolCall" && successfulToolCallIds.has(block.id)) {
+      const compacted = compactHistoricalToolCall(block);
+      if (compacted.pruned) {
+        saved += compacted.saved;
+        savedToolArgs += compacted.saved;
+        touched = true;
+        toolArgsPruned++;
+        toolCallsCompacted++;
+        return compacted.block;
+      }
+
       const result = pruneArgValue(block.arguments ?? {}, `${block.name ?? "tool"}.arguments`);
       if (result.pruned > 0) {
         saved += result.saved;
@@ -650,9 +774,9 @@ function pruneAssistantContext(
   });
 
   if (!touched) {
-    return { message, saved: 0, savedEntity: 0, savedToolArgs: 0, touched: false, entityPruned: 0, toolArgsPruned: 0 };
+    return { message, saved: 0, savedEntity: 0, savedToolArgs: 0, touched: false, entityPruned: 0, toolArgsPruned: 0, toolCallsCompacted: 0 };
   }
-  return { message: { ...message, content }, saved, savedEntity, savedToolArgs, touched, entityPruned, toolArgsPruned };
+  return { message: { ...message, content }, saved, savedEntity, savedToolArgs, touched, entityPruned, toolArgsPruned, toolCallsCompacted };
 }
 
 function rememberContextFingerprint(
@@ -726,6 +850,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
   const latestReadByPath = new Map<string, number>();
   const latestMutationByPath = new Map<string, number>();
   const latestSnapshotCommand = new Map<string, number>();
+  const latestToolEntityResult = new Map<string, number>();
   const latestEntityIndex = new Map<string, number>();
   const successfulToolCallIds = new Set<string>();
 
@@ -740,12 +865,17 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
 
     if (message?.role === "toolResult") {
       const call = calls.get(message.toolCallId);
+      const toolName = call?.name ?? message.toolName ?? "tool";
       if (call?.name === "read") {
         const path = normalizePath(call.args.path);
         if (path && !message.isError) latestReadByPath.set(path, index);
       }
       if (call?.name === "bash" && !message.isError && isSnapshotCommand(call.args.command)) {
         latestSnapshotCommand.set(String(call.args.command).trim(), index);
+      }
+      if (!message.isError) {
+        const ids = toolEntityIds(toolName, textFromContent(message.content), call?.args ?? {});
+        for (const id of ids) latestToolEntityResult.set(`${toolName}:${id}`, index);
       }
     }
 
@@ -784,6 +914,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
       current = assistant.message;
       stats.contextEntityPruned += assistant.entityPruned;
       stats.contextToolCallArgsPruned += assistant.toolArgsPruned;
+      stats.contextToolCallsCompacted += assistant.toolCallsCompacted;
       recordSavings(assistant.savedEntity, "savedEntityChars");
       recordSavings(assistant.savedToolArgs, "savedToolCallArgChars");
       touched++;
@@ -820,6 +951,17 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
       const label = `custom:${current.customType ?? "message"}`;
       const fullText = textFromContent(current.content);
       if (!fullText) return current;
+
+      const structuredNotice = pruneStructuredEntityNotice(fullText, label, index, latestEntityIndex);
+      if (structuredNotice.pruned) {
+        stats.contextCustomMessagesPruned++;
+        const entityCompacted = structuredNotice.text.startsWith("[cprune: older structured ");
+        if (entityCompacted) stats.contextEntityPruned++;
+        touched++;
+        recordSavings(structuredNotice.saved, entityCompacted ? "savedEntityChars" : "savedCustomChars");
+        if (entityCompacted) recordEntityFamilySavings(extractEntityIds(fullText), structuredNotice.saved);
+        return cloneWithText(current, structuredNotice.text);
+      }
 
       const entityPruned = pruneEntityText(fullText, label, index, latestEntityIndex, seenEntities);
       if (entityPruned.pruned) {
@@ -886,6 +1028,20 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
     const toolName = call?.name ?? current.toolName ?? "tool";
     const fullText = textFromContent(current.content);
     if (!fullText) return current;
+
+    const ids = toolEntityIds(toolName, fullText, call?.args ?? {});
+    if (!current.isError && ids.length > 0 && fullText.length >= config.minSupersededToolResultChars) {
+      const latestForSameToolEntity = Math.max(...ids.map((id) => latestToolEntityResult.get(`${toolName}:${id}`) ?? index));
+      if (latestForSameToolEntity > index) {
+        const hash = hashText(normalizeEntityText(fullText) || fullText);
+        const replacement = `[cprune: superseded ${toolName} result omitted; entities=${ids.join(",")}; newer ${toolName} result appears at message index ${latestForSameToolEntity}; hash=${shortHash(hash)}; original=${fullText.length} chars. Re-run/show entity for full current state.]`;
+        stats.contextSupersededToolResults++;
+        touched++;
+        recordSavings(Math.max(0, fullText.length - replacement.length), "savedSupersededToolResultChars");
+        recordEntityFamilySavings(ids, Math.max(0, fullText.length - replacement.length));
+        return cloneWithText(current, replacement);
+      }
+    }
 
     const entityPruned = pruneEntityText(fullText, `${toolName} result`, index, latestEntityIndex, seenEntities);
     if (entityPruned.pruned) {
@@ -1234,6 +1390,7 @@ function simulatePrunedContext(ctx: any) {
     duplicates: stats.contextDuplicates - snapshot.contextDuplicates,
     appendPruned: stats.contextAppendPruned - snapshot.contextAppendPruned,
     supersededCommands: stats.contextSupersededCommands - snapshot.contextSupersededCommands,
+    supersededToolResults: stats.contextSupersededToolResults - snapshot.contextSupersededToolResults,
     chunks: stats.contextChunkPruned - snapshot.contextChunkPruned,
     customMessages: stats.contextCustomMessagesPruned - snapshot.contextCustomMessagesPruned,
     entities: stats.contextEntityPruned - snapshot.contextEntityPruned,
@@ -1247,6 +1404,7 @@ function simulatePrunedContext(ctx: any) {
     savedDuplicates: stats.savedDuplicateChars - snapshot.savedDuplicateChars,
     savedAppend: stats.savedAppendChars - snapshot.savedAppendChars,
     savedSupersededCommands: stats.savedSupersededCommandChars - snapshot.savedSupersededCommandChars,
+    savedSupersededToolResults: stats.savedSupersededToolResultChars - snapshot.savedSupersededToolResultChars,
     savedChunks: stats.savedChunkChars - snapshot.savedChunkChars,
     savedCustom: stats.savedCustomChars - snapshot.savedCustomChars,
     savedEntities: stats.savedEntityChars - snapshot.savedEntityChars,
@@ -1281,6 +1439,7 @@ function contextStatText(ctx: any): string {
     passDelta.duplicates,
     passDelta.appendPruned,
     passDelta.supersededCommands,
+    passDelta.supersededToolResults,
     passDelta.chunks,
     passDelta.customMessages,
     passDelta.entities,
@@ -1316,6 +1475,7 @@ function contextStatText(ctx: any): string {
     `  ${countBar("entity snapshots pruned", passDelta.entities, maxRuleCount)}`,
     `  ${countBar("tool-call args pruned", passDelta.toolCallArgs, maxRuleCount)}`,
     `  ${countBar("superseded snapshot commands", passDelta.supersededCommands, maxRuleCount)}`,
+    `  ${countBar("superseded tool results", passDelta.supersededToolResults, maxRuleCount)}`,
     `  ${countBar("oversized old results", passDelta.truncations, maxRuleCount)}`,
     `  ${countBar("exact duplicates", passDelta.duplicates, maxRuleCount)}`,
     ...entityFamilyLines(passDelta.entityFamilyPruned, passDelta.entityFamilySavedChars),
@@ -1330,6 +1490,7 @@ function contextStatText(ctx: any): string {
     `  ${countBar("tool-call arg chars", passDelta.savedToolCallArgs, Math.max(1, passDelta.saved))}`,
     `  ${countBar("truncation chars", passDelta.savedTruncations, Math.max(1, passDelta.saved))}`,
     `  ${countBar("superseded cmd chars", passDelta.savedSupersededCommands, Math.max(1, passDelta.saved))}`,
+    `  ${countBar("superseded tool chars", passDelta.savedSupersededToolResults, Math.max(1, passDelta.saved))}`,
     `  ${countBar("duplicate chars", passDelta.savedDuplicates, Math.max(1, passDelta.saved))}`,
     "",
     `Rule-estimated saved chars: ${fmtInt(passDelta.saved)}`,
@@ -1366,7 +1527,9 @@ function statusText(ctx?: any): string {
     `  custom messages pruned   : ${fmtInt(stats.contextCustomMessagesPruned)}`,
     `  entity snapshots pruned  : ${fmtInt(stats.contextEntityPruned)}`,
     `  tool-call args pruned    : ${fmtInt(stats.contextToolCallArgsPruned)}`,
+    `  tool calls compacted     : ${fmtInt(stats.contextToolCallsCompacted)}`,
     `  superseded commands      : ${fmtInt(stats.contextSupersededCommands)}`,
+    `  superseded tool results  : ${fmtInt(stats.contextSupersededToolResults)}`,
     `  old results truncated    : ${fmtInt(stats.contextTruncations)}`,
     `  thinking blocks dropped  : ${fmtInt(stats.thinkingBlocksDropped)}`,
     `  auto compactions         : ${fmtInt(stats.compactionsTriggered)}`,
@@ -1377,6 +1540,7 @@ function statusText(ctx?: any): string {
     `  duplicates                : ${fmtInt(stats.savedDuplicateChars)} chars`,
     `  append/contained          : ${fmtInt(stats.savedAppendChars)} chars`,
     `  superseded commands       : ${fmtInt(stats.savedSupersededCommandChars)} chars`,
+    `  superseded tool results   : ${fmtInt(stats.savedSupersededToolResultChars)} chars`,
     `  repeated chunks           : ${fmtInt(stats.savedChunkChars)} chars`,
     `  custom messages           : ${fmtInt(stats.savedCustomChars)} chars`,
     `  entities                  : ${fmtInt(stats.savedEntityChars)} chars`,
