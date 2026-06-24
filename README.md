@@ -15,6 +15,12 @@ cprune has two pruning points:
 
 cprune should not be described as fully lossless. Persist-time pruning is near-lossless but still replaces bytes in saved tool results for the safe cases above. Prompt-time pruning may replace older details with hashes, IDs, previews, and re-run hints. This reduces token use, but the model may no longer see every historical byte in the immediate request.
 
+cprune has three operating modes:
+
+- **off**: no pruning is applied to future tool results or model prompts.
+- **safe**: conservative mode. Persist-time pruning still handles mechanical duplicate/append/oversized tool results, and prompt-time pruning applies low-risk mechanical rules plus user-approved exclusions. It avoids semantic/latest-wins rules such as stale reads, entity snapshot pruning, old thinking removal, and historical tool-call argument compaction.
+- **full**: aggressive/default legacy behavior. Includes safe rules plus semantic/latest-wins prompt-time pruning, stale reads, entity/tool-result supersession, old thinking removal, and tool-call argument compaction.
+
 Risk levels:
 
 - Low risk / near-lossless: exact duplicates, normalized duplicates, exact append/prefix repeats, and repeated chunks where a newer full copy remains.
@@ -41,7 +47,8 @@ Or install/configure it as a Pi package; `package.json` exposes `src/cprune.ts` 
 /cprune review             Pick large older context entries to exclude from future prompts
 /cprune review-prompts [safe|full] [N] [page] Pick a prompt/response turn from history
 /cprune clear-exclusions   Clear user-approved prompt-time exclusions
-/cprune on                 Enable pruning
+/cprune safe               Enable conservative pruning
+/cprune full               Enable full/aggressive pruning (`on` is an alias)
 /cprune off                Disable pruning
 /cprune compact            Lossily compact/prune context via Pi compaction
 ```
@@ -52,13 +59,14 @@ cprune also registers an LLM-callable tool named `cprune_status` with actions:
 
 ```text
 status        Show cumulative pruning counters
-stats         Compare raw context vs simulated cprune-pruned context
-on            Enable pruning
+stats         Compare off/safe/full context sizes
+safe          Enable conservative pruning
+full          Enable full/aggressive pruning (`on` is an alias)
 off           Disable pruning
 compact       Lossily compact/prune context via Pi compaction
 ```
 
-`/cprune stats` and `cprune_status action="stats"` work whether pruning is on or off, so you can compare estimated savings before enabling it. (`stat` and the old `context-stat` action are accepted as aliases.) The output includes grouped sections, orange/green continuous bars, before/after breakdown by context part, per-rule hit counts, per-rule character savings, and any user-approved exclusions.
+`/cprune stats` and `cprune_status action="stats"` work in any mode, so you can compare estimated savings before enabling pruning. (`stat` and the old `context-stat` action are accepted as aliases.) The output compares **off** (red), **safe** (orange), and **full** (green), then shows safe/full breakdowns by context part, per-rule hit counts, per-rule character savings, and any user-approved exclusions.
 
 `/cprune review-prompts [safe|full] [N] [page]` is useful after accidentally pushing a noisy prompt/response/tool-output turn into context. Safe mode is the default and mirrors Pi prompt behavior: it skips hidden shell entries such as `!!cmd` because Pi marks them `excludeFromContext`, while keeping normal `!cmd` entries as selectable shell-command items. Full mode shows raw branch history, including hidden `!!cmd` entries, for users who want complete visibility. The selected turn is excluded from future prompts when it appears in model context; Pi session entries are not deleted. Results are paginated; jump directly with e.g. `/cprune review-prompts safe 50 2` or `/cprune review-prompts full 50`.
 

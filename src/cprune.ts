@@ -69,6 +69,8 @@ type CpruneStats = {
 
 const CUSTOM_TYPE = "cprune:state";
 
+type CpruneMode = "off" | "safe" | "full";
+
 const config = {
   // Persist-time pruning: affects what gets stored in the session from now on.
   minDuplicateChars: 1_000,
@@ -160,7 +162,7 @@ const manualOmissions = new Map<string, ManualOmission>();
 const manualTurnOmissions = new Map<string, ManualTurnOmission>();
 let lastCompactAt = 0;
 let compactInFlight = false;
-let enabled = true;
+let mode: CpruneMode = "full";
 
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex");
@@ -644,7 +646,7 @@ function loadStateFromSession(ctx: any) {
   stats.entityFamilyPruned = { ...(stateEntry.data.stats?.entityFamilyPruned ?? {}) };
   stats.entityFamilySavedChars = { ...(stateEntry.data.stats?.entityFamilySavedChars ?? {}) };
   lastCompactAt = stateEntry.data.lastCompactAt ?? 0;
-  enabled = stateEntry.data.enabled ?? true;
+  mode = stateEntry.data.mode ?? (stateEntry.data.enabled === false ? "off" : "full");
 
   if (Array.isArray(stateEntry.data.seenOutputs)) {
     seenOutputs.clear();
@@ -671,7 +673,8 @@ function loadStateFromSession(ctx: any) {
 function saveState(pi: ExtensionAPI) {
   pi.appendEntry(CUSTOM_TYPE, {
     stats,
-    enabled,
+    enabled: mode !== "off",
+    mode,
     lastCompactAt,
     seenOutputs: [...seenOutputs.values()].slice(-config.maxSeenHashes),
     manualOmissions: [...manualOmissions.values()],
@@ -922,8 +925,10 @@ function pruneRepeatedLineChunks(
   return { text: out.join("\n"), saved, pruned };
 }
 
-function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
+function pruneContextMessages(messages: AnyMessage[], pruneMode: CpruneMode = mode): AnyMessage[] {
+  if (pruneMode === "off") return messages;
   stats.contextPasses++;
+  const fullMode = pruneMode === "full";
 
   const turnOmitted = applyManualTurnOmissions(messages);
   messages = turnOmitted.messages;
@@ -949,7 +954,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
     if (message?.role === "toolResult") {
       const call = calls.get(message.toolCallId);
       const toolName = call?.name ?? message.toolName ?? "tool";
-      if (call?.name === "read") {
+      if (fullMode && call?.name === "read") {
         const path = normalizePath(call.args.path);
         if (path && !message.isError) latestReadByPath.set(path, index);
       }
@@ -994,7 +999,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
 
     let current = message;
 
-    const thinking = pruneAssistantThinking(current);
+    const thinking = fullMode ? pruneAssistantThinking(current) : { message: current, saved: 0, dropped: 0 };
     if (thinking.dropped > 0) {
       current = thinking.message;
       stats.thinkingBlocksDropped += thinking.dropped;
@@ -1002,7 +1007,9 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
       touched++;
     }
 
-    const assistant = pruneAssistantContext(current, index, latestEntityIndex, seenEntities, successfulToolCallIds);
+    const assistant = fullMode
+      ? pruneAssistantContext(current, index, latestEntityIndex, seenEntities, successfulToolCallIds)
+      : { message: current, saved: 0, savedEntity: 0, savedToolArgs: 0, touched: false, entityPruned: 0, toolArgsPruned: 0, toolCallsCompacted: 0 };
     if (assistant.touched) {
       current = assistant.message;
       stats.contextEntityPruned += assistant.entityPruned;
@@ -1013,7 +1020,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
       touched++;
     }
 
-    if (current?.role === "compactionSummary" || current?.role === "branchSummary") {
+    if (fullMode && (current?.role === "compactionSummary" || current?.role === "branchSummary")) {
       const fullText = String(current.summary ?? "");
       const entityPruned = pruneEntityText(fullText, current.role, index, latestEntityIndex, seenEntities);
       if (entityPruned.pruned) {
@@ -1026,7 +1033,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
       return current;
     }
 
-    if (current?.role === "user") {
+    if (fullMode && current?.role === "user") {
       const fullText = textFromContent(current.content);
       if (!fullText) return current;
       const entityPruned = pruneEntityText(fullText, "user message", index, latestEntityIndex, seenEntities);
@@ -1045,7 +1052,9 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
       const fullText = textFromContent(current.content);
       if (!fullText) return current;
 
-      const structuredNotice = pruneStructuredEntityNotice(fullText, label, index, latestEntityIndex);
+      const structuredNotice = fullMode
+        ? pruneStructuredEntityNotice(fullText, label, index, latestEntityIndex)
+        : { text: fullText, saved: 0, pruned: false, strippedBoilerplate: false };
       if (structuredNotice.pruned) {
         stats.contextCustomMessagesPruned++;
         const entityCompacted = structuredNotice.text.startsWith("[cprune: older structured ");
@@ -1056,7 +1065,9 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
         return cloneWithText(current, structuredNotice.text);
       }
 
-      const entityPruned = pruneEntityText(fullText, label, index, latestEntityIndex, seenEntities);
+      const entityPruned = fullMode
+        ? pruneEntityText(fullText, label, index, latestEntityIndex, seenEntities)
+        : { text: fullText, saved: 0, pruned: false };
       if (entityPruned.pruned) {
         stats.contextEntityPruned++;
         stats.contextCustomMessagesPruned++;
@@ -1123,7 +1134,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
     if (!fullText) return current;
 
     const ids = toolEntityIds(toolName, fullText, call?.args ?? {});
-    if (!current.isError && ids.length > 0 && fullText.length >= config.minSupersededToolResultChars) {
+    if (fullMode && !current.isError && ids.length > 0 && fullText.length >= config.minSupersededToolResultChars) {
       const latestForSameToolEntity = Math.max(...ids.map((id) => latestToolEntityResult.get(`${toolName}:${id}`) ?? index));
       if (latestForSameToolEntity > index) {
         const hash = hashText(normalizeEntityText(fullText) || fullText);
@@ -1136,7 +1147,9 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
       }
     }
 
-    const entityPruned = pruneEntityText(fullText, `${toolName} result`, index, latestEntityIndex, seenEntities);
+    const entityPruned = fullMode
+      ? pruneEntityText(fullText, `${toolName} result`, index, latestEntityIndex, seenEntities)
+      : { text: fullText, saved: 0, pruned: false };
     if (entityPruned.pruned) {
       stats.contextEntityPruned++;
       touched++;
@@ -1147,7 +1160,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
 
     // Stale file reads: an older read is superseded by a newer read of the same file
     // or by a later edit/write call to that file.
-    if (toolName === "read") {
+    if (fullMode && toolName === "read") {
       const path = normalizePath(call?.args.path);
       if (path) {
         const newerRead = latestReadByPath.get(path);
@@ -1168,7 +1181,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
     // Superseded read-only snapshot commands. If an old `rg`, `find`, `ls`,
     // `git status`, etc. command was run again later, the newer snapshot is
     // usually the one that matters. Keep structure, omit the old bulk.
-    if (toolName === "bash" && isSnapshotCommand(call?.args.command)) {
+    if (fullMode && toolName === "bash" && isSnapshotCommand(call?.args.command)) {
       const command = String(call?.args.command).trim();
       const newerRun = latestSnapshotCommand.get(command);
       if (newerRun !== undefined && newerRun > index) {
@@ -1495,14 +1508,14 @@ function bar(value: number, max: number, width = 32): string {
   return `${filled}${padding}`;
 }
 
-function colorBar(value: number, max: number, kind: "before" | "after", width = 24): string {
+function colorBar(value: number, max: number, kind: "off" | "safe" | "full" | "before" | "after", width = 24): string {
   const { filled, padding } = blockBar(value, max, width);
   if (!filled) return padding;
 
   // Use simple SGR color codes only. cprune never writes to stdout/stderr; this
   // string is returned through Pi's normal UI/tool surfaces. The earlier MCP
   // lifecycle line was from context-mode, not these bars.
-  const color = kind === "before" ? "\x1b[38;5;208m" : "\x1b[32m";
+  const color = kind === "off" || kind === "before" ? "\x1b[31m" : kind === "safe" ? "\x1b[38;5;208m" : "\x1b[32m";
   const reset = "\x1b[0m";
   return `${color}${filled}${reset}${padding}`;
 }
@@ -1532,8 +1545,41 @@ function breakdownLines(before: Breakdown, after: Breakdown): string[] {
     const a = after[label] ?? 0;
     const saved = Math.max(0, b - a);
     return [
-      `  ${label.padEnd(20)} ${colorBar(b, max, "before", 12)} ${fmtInt(b).padStart(10)} chars`,
-      `  ${"".padEnd(20)} ${colorBar(a, max, "after", 12)} ${fmtInt(a).padStart(10)} chars  saved ${fmtInt(saved)}`,
+      `  ${label.padEnd(20)} ${colorBar(b, max, "off", 12)} ${fmtInt(b).padStart(10)} chars`,
+      `  ${"".padEnd(20)} ${colorBar(a, max, "full", 12)} ${fmtInt(a).padStart(10)} chars  saved ${fmtInt(saved)}`,
+    ];
+  });
+}
+
+function triBreakdownLines(off: Breakdown, safe: Breakdown, full: Breakdown): string[] {
+  const labels = [
+    "tool results",
+    "assistant thinking",
+    "assistant text",
+    "tool calls",
+    "custom messages",
+    "user messages",
+    "summaries",
+    "bash executions",
+    "assistant other",
+    "other",
+  ];
+  const dynamic = [...new Set([...Object.keys(off), ...Object.keys(safe), ...Object.keys(full)])]
+    .filter((label) => !labels.includes(label))
+    .sort();
+  const ordered = [...labels, ...dynamic].filter(
+    (label) => (off[label] ?? 0) > 0 || (safe[label] ?? 0) > 0 || (full[label] ?? 0) > 0,
+  );
+  const max = Math.max(1, ...ordered.map((label) => Math.max(off[label] ?? 0, safe[label] ?? 0, full[label] ?? 0)));
+
+  return ordered.flatMap((label) => {
+    const o = off[label] ?? 0;
+    const s = safe[label] ?? 0;
+    const f = full[label] ?? 0;
+    return [
+      `  ${label.padEnd(20)} ${colorBar(o, max, "off", 12)} ${fmtInt(o).padStart(10)} chars  off`,
+      `  ${"".padEnd(20)} ${colorBar(s, max, "safe", 12)} ${fmtInt(s).padStart(10)} chars  safe saved ${fmtInt(Math.max(0, o - s))}`,
+      `  ${"".padEnd(20)} ${colorBar(f, max, "full", 12)} ${fmtInt(f).padStart(10)} chars  full saved ${fmtInt(Math.max(0, o - f))}`,
     ];
   });
 }
@@ -1560,12 +1606,12 @@ function entityFamilyLines(counts: Record<string, number>, saved: Record<string,
   ];
 }
 
-function simulatePrunedContext(ctx: any) {
+function simulatePrunedContext(ctx: any, pruneMode: CpruneMode) {
   const rawMessages = currentContextMessages(ctx);
   const before = contextSize(rawMessages);
 
   const snapshot = cloneStats();
-  const prunedMessages = pruneContextMessages(rawMessages);
+  const prunedMessages = pruneContextMessages(rawMessages, pruneMode);
   const passDelta = {
     staleReads: stats.contextStaleReads - snapshot.contextStaleReads,
     duplicates: stats.contextDuplicates - snapshot.contextDuplicates,
@@ -1599,6 +1645,7 @@ function simulatePrunedContext(ctx: any) {
   restoreStats(snapshot);
 
   return {
+    mode: pruneMode,
     before,
     after: contextSize(prunedMessages),
     beforeBreakdown: contextBreakdown(rawMessages),
@@ -1607,15 +1654,7 @@ function simulatePrunedContext(ctx: any) {
   };
 }
 
-function contextStatText(ctx: any): string {
-  const { before, after, beforeBreakdown, afterBreakdown, passDelta } = simulatePrunedContext(ctx);
-  const savedChars = Math.max(0, before.chars - after.chars);
-  const savedPct = before.chars > 0 ? (savedChars / before.chars) * 100 : 0;
-  const usage = ctx.getContextUsage?.();
-  const modelUsage = usage
-    ? `${usage.tokens ?? "unknown"}/${usage.contextWindow} tokens (${usage.percent?.toFixed(1) ?? "?"}%)`
-    : "unknown";
-
+function ruleSummaryLines(label: string, passDelta: ReturnType<typeof simulatePrunedContext>["passDelta"]): string[] {
   const maxRuleCount = Math.max(
     1,
     passDelta.staleReads,
@@ -1631,26 +1670,8 @@ function contextStatText(ctx: any): string {
     passDelta.manualOmissions,
     passDelta.thinkingBlocks,
   );
-  const rawPct = before.chars > 0 ? 100 : 0;
-  const afterPct = before.chars > 0 ? (after.chars / before.chars) * 100 : 0;
-
   return [
-    "cprune stats",
-    "",
-    "Summary",
-    `  pruning           : ${enabled ? "on" : "off"}`,
-    `  model context     : ${modelUsage}`,
-    `  messages          : ${fmtInt(before.messages)} total, ${fmtInt(passDelta.touched)} touched`,
-    `  estimated savings : ${fmtInt(savedChars)} chars (~${fmtInt(Math.ceil(savedChars / 4))} tokens, ${fmtPct(savedPct)})`,
-    "",
-    "Total before / after",
-    `  before ${colorBar(before.chars, before.chars, "before")} ${fmtInt(before.chars)} chars  ~${fmtInt(before.approxTokens)} tok  ${fmtPct(rawPct)}`,
-    `  after  ${colorBar(after.chars, before.chars, "after")} ${fmtInt(after.chars)} chars  ~${fmtInt(after.approxTokens)} tok  ${fmtPct(afterPct)}`,
-    "",
-    "Breakdown by context part",
-    ...breakdownLines(beforeBreakdown, afterBreakdown),
-    "",
-    "Rule hits in this simulation",
+    label,
     `  ${countBar("old thinking blocks", passDelta.thinkingBlocks, maxRuleCount)}`,
     `  ${countBar("stale file reads", passDelta.staleReads, maxRuleCount)}`,
     `  ${countBar("append/contained repeats", passDelta.appendPruned, maxRuleCount)}`,
@@ -1665,7 +1686,7 @@ function contextStatText(ctx: any): string {
     `  ${countBar("exact duplicates", passDelta.duplicates, maxRuleCount)}`,
     ...entityFamilyLines(passDelta.entityFamilyPruned, passDelta.entityFamilySavedChars),
     "",
-    "Savings by rule",
+    `${label.replace("Rule hits", "Savings")} by rule`,
     `  ${countBar("thinking chars", passDelta.savedThinking, Math.max(1, passDelta.saved))}`,
     `  ${countBar("stale read chars", passDelta.savedStaleReads, Math.max(1, passDelta.saved))}`,
     `  ${countBar("append/repeat chars", passDelta.savedAppend, Math.max(1, passDelta.saved))}`,
@@ -1679,7 +1700,43 @@ function contextStatText(ctx: any): string {
     `  ${countBar("manual omit chars", passDelta.savedManualOmissions, Math.max(1, passDelta.saved))}`,
     `  ${countBar("duplicate chars", passDelta.savedDuplicates, Math.max(1, passDelta.saved))}`,
     "",
-    `Rule-estimated saved chars: ${fmtInt(passDelta.saved)}`,
+    `  rule-estimated saved chars: ${fmtInt(passDelta.saved)}`,
+  ];
+}
+
+function contextStatText(ctx: any): string {
+  const off = simulatePrunedContext(ctx, "off");
+  const safe = simulatePrunedContext(ctx, "safe");
+  const full = simulatePrunedContext(ctx, "full");
+  const usage = ctx.getContextUsage?.();
+  const modelUsage = usage
+    ? `${usage.tokens ?? "unknown"}/${usage.contextWindow} tokens (${usage.percent?.toFixed(1) ?? "?"}%)`
+    : "unknown";
+
+  const safeSaved = Math.max(0, off.before.chars - safe.after.chars);
+  const fullSaved = Math.max(0, off.before.chars - full.after.chars);
+  const safePct = off.before.chars > 0 ? (safeSaved / off.before.chars) * 100 : 0;
+  const fullPct = off.before.chars > 0 ? (fullSaved / off.before.chars) * 100 : 0;
+
+  return [
+    "cprune stats",
+    "",
+    "Summary",
+    `  active mode       : ${mode}`,
+    `  model context     : ${modelUsage}`,
+    `  messages          : ${fmtInt(off.before.messages)} total, safe touches ${fmtInt(safe.passDelta.touched)}, full touches ${fmtInt(full.passDelta.touched)}`,
+    "",
+    "Mode comparison",
+    `  off   ${colorBar(off.before.chars, off.before.chars, "off")} ${fmtInt(off.before.chars)} chars  ~${fmtInt(off.before.approxTokens)} tok  0 saved`,
+    `  safe  ${colorBar(safe.after.chars, off.before.chars, "safe")} ${fmtInt(safe.after.chars)} chars  ~${fmtInt(safe.after.approxTokens)} tok  saved ${fmtInt(safeSaved)} (${fmtPct(safePct)})`,
+    `  full  ${colorBar(full.after.chars, off.before.chars, "full")} ${fmtInt(full.after.chars)} chars  ~${fmtInt(full.after.approxTokens)} tok  saved ${fmtInt(fullSaved)} (${fmtPct(fullPct)})`,
+    "",
+    "Breakdown by context part (off / safe / full)",
+    ...triBreakdownLines(off.beforeBreakdown, safe.afterBreakdown, full.afterBreakdown),
+    "",
+    ...ruleSummaryLines("Rule hits in safe simulation", safe.passDelta),
+    "",
+    ...ruleSummaryLines("Rule hits in full simulation", full.passDelta),
   ].join("\n");
 }
 
@@ -1693,7 +1750,7 @@ function statusText(ctx?: any): string {
     "cprune status",
     "",
     "State",
-    `  pruning                  : ${enabled ? "on" : "off"}`,
+    `  mode                     : ${mode}`,
     `  ${usageLine}`,
     `  seen output hashes       : ${fmtInt(seenOutputs.size)}`,
     `  user exclusions          : ${fmtInt(manualOmissions.size + manualTurnOmissions.size)}`,
@@ -1963,7 +2020,7 @@ function cpruneCompactInstructions(reason: string): string {
 }
 
 function maybeTriggerCompaction(ctx: any) {
-  if (!enabled || !config.autoCompactAtPercent || compactInFlight) return;
+  if (mode === "off" || !config.autoCompactAtPercent || compactInFlight) return;
 
   const usage = ctx.getContextUsage?.();
   if (!usage?.percent || usage.percent < config.autoCompactAtPercent) return;
@@ -1972,7 +2029,7 @@ function maybeTriggerCompaction(ctx: any) {
   // prunes at the LLM boundary, only compact when the simulated pruned footprint
   // is also above the threshold. Preserve any model-reported overhead (system
   // prompt/tool schemas/etc.) by adding it back to the pruned message estimate.
-  const footprint = simulatePrunedContext(ctx);
+  const footprint = simulatePrunedContext(ctx, mode);
   const reportedTokens = typeof usage.tokens === "number" ? usage.tokens : footprint.before.approxTokens;
   const overheadTokens = Math.max(0, reportedTokens - footprint.before.approxTokens);
   const prunedEstimatedTokens = overheadTokens + footprint.after.approxTokens;
@@ -2002,7 +2059,7 @@ function maybeTriggerCompaction(ctx: any) {
 export default function cprune(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     loadStateFromSession(ctx);
-    ctx.ui.setStatus("cprune", `cprune: ${enabled ? "on" : "off"}`);
+    ctx.ui.setStatus("cprune", `cprune: ${mode}`);
   });
 
   pi.on("session_shutdown", () => {
@@ -2010,7 +2067,7 @@ export default function cprune(pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", (event) => {
-    if (!enabled) return;
+    if (mode === "off") return;
 
     stats.toolResultsSeen++;
 
@@ -2091,8 +2148,8 @@ export default function cprune(pi: ExtensionAPI) {
   });
 
   pi.on("context", (event) => {
-    if (!enabled) return;
-    return { messages: pruneContextMessages(event.messages) };
+    if (mode === "off") return;
+    return { messages: pruneContextMessages(event.messages, mode) };
   });
 
   pi.on("agent_end", (_event, ctx) => {
@@ -2100,24 +2157,32 @@ export default function cprune(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cprune", {
-    description: "Control cprune: /cprune on|off|status|stats|review|review-prompts|compact",
+    description: "Control cprune: /cprune off|safe|full|status|stats|review|review-prompts|compact",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const action = parts[0] ?? "status";
 
-      if (action === "on") {
-        enabled = true;
-        ctx.ui.setStatus("cprune", "cprune: on");
+      if (action === "on" || action === "full") {
+        mode = "full";
+        ctx.ui.setStatus("cprune", "cprune: full");
         saveState(pi);
-        ctx.ui.notify("cprune: pruning enabled", "info");
+        ctx.ui.notify("cprune: full pruning enabled", "info");
+        return;
+      }
+
+      if (action === "safe") {
+        mode = "safe";
+        ctx.ui.setStatus("cprune", "cprune: safe");
+        saveState(pi);
+        ctx.ui.notify("cprune: safe pruning enabled", "info");
         return;
       }
 
       if (action === "off") {
-        enabled = false;
+        mode = "off";
         ctx.ui.setStatus("cprune", "cprune: off");
         saveState(pi);
-        ctx.ui.notify("cprune: pruning disabled. /cprune stats still simulates potential savings.", "info");
+        ctx.ui.notify("cprune: pruning disabled. /cprune stats still simulates safe/full savings.", "info");
         return;
       }
 
@@ -2165,7 +2230,7 @@ export default function cprune(pi: ExtensionAPI) {
         });
         return;
       }
-      ctx.ui.notify("Usage: /cprune [on|off|status|stats|review|review-prompts [safe|full] [N] [page]|clear-exclusions|compact]", "warning");
+      ctx.ui.notify("Usage: /cprune [off|safe|full|status|stats|review|review-prompts [safe|full] [N] [page]|clear-exclusions|compact]", "warning");
     },
   });
 
@@ -2173,11 +2238,11 @@ export default function cprune(pi: ExtensionAPI) {
     name: "cprune_status",
     label: "cprune status",
     description:
-      "Control cprune and inspect pruning impact. Supports status, stats, on, off, and compact actions.",
+      "Control cprune and inspect pruning impact. Supports status, stats, off, safe, full, and compact actions.",
     promptSnippet: "Control cprune and report pruning status/statistics",
     promptGuidelines: [
       "Use cprune_status with action=\"stats\" when the user asks whether cprune is saving context or whether pruning is effective.",
-      "Use cprune_status with action=\"on\" or action=\"off\" when the user asks to enable or disable cprune pruning.",
+      "Use cprune_status with action=\"safe\", action=\"full\", or action=\"off\" when the user asks to set cprune pruning mode.",
       "Use cprune_status with action=\"compact\" when the user asks to persistently compact/prune context via Pi compaction. This is lossy summarization.",
     ],
     parameters: Type.Object({
@@ -2190,11 +2255,13 @@ export default function cprune(pi: ExtensionAPI) {
             Type.Literal("context-stat"),
             Type.Literal("on"),
             Type.Literal("off"),
+            Type.Literal("safe"),
+            Type.Literal("full"),
             Type.Literal("compact"),
           ],
           {
             description:
-              "status: cumulative counters; stats: simulate raw vs pruned context; on/off: enable or disable pruning; compact: request persistent cprune-focused lossy compaction.",
+              "status: cumulative counters; stats: compare off/safe/full context; off/safe/full: set pruning mode (on aliases full); compact: request persistent cprune-focused lossy compaction.",
           },
         ),
       ),
@@ -2202,27 +2269,34 @@ export default function cprune(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const action = params.action ?? "status";
 
-      if (action === "on") {
-        enabled = true;
-        ctx.ui.setStatus("cprune", "cprune: on");
+      if (action === "on" || action === "full") {
+        mode = "full";
+        ctx.ui.setStatus("cprune", "cprune: full");
         saveState(pi);
-        return { content: textContent("cprune: pruning enabled"), details: { enabled, stats } };
+        return { content: textContent("cprune: full pruning enabled"), details: { mode, enabled: true, stats } };
+      }
+
+      if (action === "safe") {
+        mode = "safe";
+        ctx.ui.setStatus("cprune", "cprune: safe");
+        saveState(pi);
+        return { content: textContent("cprune: safe pruning enabled"), details: { mode, enabled: true, stats } };
       }
 
       if (action === "off") {
-        enabled = false;
+        mode = "off";
         ctx.ui.setStatus("cprune", "cprune: off");
         saveState(pi);
         return {
-          content: textContent("cprune: pruning disabled. cprune_status action=\"stats\" still simulates potential savings."),
-          details: { enabled, stats },
+          content: textContent("cprune: pruning disabled. cprune_status action=\"stats\" still simulates safe/full savings."),
+          details: { mode, enabled: mode !== "off", stats },
         };
       }
 
       if (action === "stats" || action === "stat" || action === "context-stat") {
         return {
           content: textContent(contextStatText(ctx)),
-          details: { enabled, stats, seenOutputHashes: seenOutputs.size },
+          details: { mode, enabled: mode !== "off", stats, seenOutputHashes: seenOutputs.size },
         };
       }
 
@@ -2232,11 +2306,11 @@ export default function cprune(pi: ExtensionAPI) {
         });
         return {
           content: textContent("cprune: compact requested (lossy persistent compaction will be added)"),
-          details: { enabled, stats },
+          details: { mode, enabled: mode !== "off", stats },
         };
       }
 
-      return { content: textContent(statusText(ctx)), details: { enabled, stats, seenOutputHashes: seenOutputs.size } };
+      return { content: textContent(statusText(ctx)), details: { mode, enabled: mode !== "off", stats, seenOutputHashes: seenOutputs.size } };
     },
   });
 }
