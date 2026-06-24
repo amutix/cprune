@@ -6,6 +6,20 @@ Append/contained pruning detects exact byte prefixes, normalized line-prefixes, 
 
 Entity-aware pruning is generic rather than tied to one extension: it detects IDs like `TASK-123`, `SPEC-12`, `DISC-3`, `ISSUE-9`, `PR-42`, etc., then applies a latest-entity-snapshot-wins policy across older user messages, custom extension messages, tool results, assistant text, and summaries while preserving IDs, hashes, and short previews. Old successful assistant tool calls can be compacted to tool name, IDs/paths, hash, and preview, so large prior spec/comment bodies do not remain in request context. Non-core tool results with the same tool+entity are also superseded by newer successful results. Stats include entity-family counts/savings such as `TASK-*`, `SPEC-*`, and `DISC-*`.
 
+## Safety and information loss
+
+cprune's normal pruning is non-destructive: it does not rewrite Pi's active session files or delete history. It changes only the context sent to the model for a request, so the original session remains available to Pi and can still be inspected or resumed.
+
+However, cprune should not be described as lossless at prompt time. Some rules intentionally replace older details with hashes, IDs, previews, and re-run hints. This reduces token use, but the model may no longer see every historical byte in the immediate request.
+
+Risk levels:
+
+- Low risk / near-lossless: exact duplicates, exact append/prefix repeats, and repeated chunks where a newer full copy remains.
+- Medium risk: stale file-read pruning, superseded entity/tool-result pruning, structured notice compaction, and historical tool-call argument compaction.
+- Explicitly lossy: old assistant thinking removal, latest-entity-snapshot-wins summaries, and `/cprune compact`.
+
+Recommended wording: cprune is **non-destructive but lossy-at-prompt-time**. It preserves recent context, errors, entity IDs, hashes, previews, and re-run hints, but it may remove historical details from the model request.
+
 ## Use
 
 From this directory:
