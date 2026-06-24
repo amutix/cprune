@@ -1158,12 +1158,16 @@ function bar(value: number, max: number, width = 32): string {
   return `${filled}${padding}`;
 }
 
-function colorBar(value: number, max: number, _kind: "before" | "after", width = 24): string {
-  // Do not emit raw ANSI escape codes from extension messages. Pi renders these
-  // strings inside its own TUI; control sequences can leak into layout/log output
-  // in some terminals. Keep bars continuous but plain-text safe.
+function colorBar(value: number, max: number, kind: "before" | "after", width = 24): string {
   const { filled, padding } = blockBar(value, max, width);
-  return `${filled}${padding}`;
+  if (!filled) return padding;
+
+  // Use simple SGR color codes only. cprune never writes to stdout/stderr; this
+  // string is returned through Pi's normal UI/tool surfaces. The earlier MCP
+  // lifecycle line was from context-mode, not these bars.
+  const color = kind === "before" ? "\x1b[38;5;208m" : "\x1b[32m";
+  const reset = "\x1b[0m";
+  return `${color}${filled}${reset}${padding}`;
 }
 
 function breakdownLines(before: Breakdown, after: Breakdown): string[] {
