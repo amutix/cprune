@@ -1584,28 +1584,6 @@ function triBreakdownLines(off: Breakdown, safe: Breakdown, full: Breakdown): st
   });
 }
 
-function countBar(label: string, value: number, max: number): string {
-  const padded = label.padEnd(29);
-  return `${padded} ${bar(value, max, 18)} ${fmtInt(value)}`;
-}
-
-function entityFamilyLines(counts: Record<string, number>, saved: Record<string, number>): string[] {
-  const families = [...new Set([...Object.keys(counts), ...Object.keys(saved)])]
-    .filter((family) => (counts[family] ?? 0) > 0 || (saved[family] ?? 0) > 0)
-    .sort();
-  if (families.length === 0) return [];
-
-  const maxSaved = Math.max(1, ...families.map((family) => saved[family] ?? 0));
-  return [
-    "",
-    "Entity family pruning",
-    ...families.map(
-      (family) =>
-        `  ${family.padEnd(10)} ${bar(saved[family] ?? 0, maxSaved, 18)} ${fmtInt(counts[family] ?? 0)} snapshots, ${fmtInt(saved[family] ?? 0)} chars`,
-    ),
-  ];
-}
-
 function simulatePrunedContext(ctx: any, pruneMode: CpruneMode) {
   const rawMessages = currentContextMessages(ctx);
   const before = contextSize(rawMessages);
@@ -1654,56 +1632,6 @@ function simulatePrunedContext(ctx: any, pruneMode: CpruneMode) {
   };
 }
 
-function ruleSummaryLines(label: string, passDelta: ReturnType<typeof simulatePrunedContext>["passDelta"]): string[] {
-  const maxRuleCount = Math.max(
-    1,
-    passDelta.staleReads,
-    passDelta.duplicates,
-    passDelta.appendPruned,
-    passDelta.supersededCommands,
-    passDelta.supersededToolResults,
-    passDelta.chunks,
-    passDelta.customMessages,
-    passDelta.entities,
-    passDelta.toolCallArgs,
-    passDelta.truncations,
-    passDelta.manualOmissions,
-    passDelta.thinkingBlocks,
-  );
-  return [
-    label,
-    `  ${countBar("old thinking blocks", passDelta.thinkingBlocks, maxRuleCount)}`,
-    `  ${countBar("stale file reads", passDelta.staleReads, maxRuleCount)}`,
-    `  ${countBar("append/contained repeats", passDelta.appendPruned, maxRuleCount)}`,
-    `  ${countBar("repeated line chunks", passDelta.chunks, maxRuleCount)}`,
-    `  ${countBar("custom messages pruned", passDelta.customMessages, maxRuleCount)}`,
-    `  ${countBar("entity snapshots pruned", passDelta.entities, maxRuleCount)}`,
-    `  ${countBar("tool-call args pruned", passDelta.toolCallArgs, maxRuleCount)}`,
-    `  ${countBar("superseded snapshot commands", passDelta.supersededCommands, maxRuleCount)}`,
-    `  ${countBar("superseded tool results", passDelta.supersededToolResults, maxRuleCount)}`,
-    `  ${countBar("oversized old results", passDelta.truncations, maxRuleCount)}`,
-    `  ${countBar("user-excluded entries", passDelta.manualOmissions, maxRuleCount)}`,
-    `  ${countBar("exact duplicates", passDelta.duplicates, maxRuleCount)}`,
-    ...entityFamilyLines(passDelta.entityFamilyPruned, passDelta.entityFamilySavedChars),
-    "",
-    `${label.replace("Rule hits", "Savings")} by rule`,
-    `  ${countBar("thinking chars", passDelta.savedThinking, Math.max(1, passDelta.saved))}`,
-    `  ${countBar("stale read chars", passDelta.savedStaleReads, Math.max(1, passDelta.saved))}`,
-    `  ${countBar("append/repeat chars", passDelta.savedAppend, Math.max(1, passDelta.saved))}`,
-    `  ${countBar("chunk chars", passDelta.savedChunks, Math.max(1, passDelta.saved))}`,
-    `  ${countBar("custom msg chars", passDelta.savedCustom, Math.max(1, passDelta.saved))}`,
-    `  ${countBar("entity chars", passDelta.savedEntities, Math.max(1, passDelta.saved))}`,
-    `  ${countBar("tool-call arg chars", passDelta.savedToolCallArgs, Math.max(1, passDelta.saved))}`,
-    `  ${countBar("truncation chars", passDelta.savedTruncations, Math.max(1, passDelta.saved))}`,
-    `  ${countBar("superseded cmd chars", passDelta.savedSupersededCommands, Math.max(1, passDelta.saved))}`,
-    `  ${countBar("superseded tool chars", passDelta.savedSupersededToolResults, Math.max(1, passDelta.saved))}`,
-    `  ${countBar("manual omit chars", passDelta.savedManualOmissions, Math.max(1, passDelta.saved))}`,
-    `  ${countBar("duplicate chars", passDelta.savedDuplicates, Math.max(1, passDelta.saved))}`,
-    "",
-    `  rule-estimated saved chars: ${fmtInt(passDelta.saved)}`,
-  ];
-}
-
 function contextStatText(ctx: any): string {
   const off = simulatePrunedContext(ctx, "off");
   const safe = simulatePrunedContext(ctx, "safe");
@@ -1735,10 +1663,6 @@ function contextStatText(ctx: any): string {
     "",
     "Breakdown by context part (off / safe / full)",
     ...triBreakdownLines(off.beforeBreakdown, safe.afterBreakdown, full.afterBreakdown),
-    "",
-    ...ruleSummaryLines("Rule hits in safe simulation", safe.passDelta),
-    "",
-    ...ruleSummaryLines("Rule hits in full simulation", full.passDelta),
   ].join("\n");
 }
 
