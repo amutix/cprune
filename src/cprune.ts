@@ -1803,9 +1803,9 @@ function reviewHistoryMessages(ctx: any): AnyMessage[] {
       return undefined;
     })
     // Raw branch history includes direct shell executions. `!!cmd` entries have
-    // excludeFromContext=true and are omitted by Pi anyway; even visible `!cmd`
-    // entries are not user prompts. Keep review-prompts focused on actual prompts.
-    .filter((message: any) => Boolean(message) && message.role !== "bashExecution");
+    // excludeFromContext=true and are omitted by Pi anyway. Keep normal `!cmd`
+    // entries visible so cprune review mirrors Pi's context behavior.
+    .filter((message: any) => Boolean(message) && !(message.role === "bashExecution" && message.excludeFromContext === true));
 }
 
 function turnCandidates(ctx: any, limit: number): TurnCandidate[] {
