@@ -31,6 +31,7 @@ type AppendMatch = {
 type CpruneStats = {
   toolResultsSeen: number;
   toolResultsDeduped: number;
+  toolResultsNormalizedDeduped: number;
   toolResultsAppendPruned: number;
   toolResultsTruncated: number;
   contextPasses: number;
@@ -96,6 +97,7 @@ const config = {
 const stats: CpruneStats = {
   toolResultsSeen: 0,
   toolResultsDeduped: 0,
+  toolResultsNormalizedDeduped: 0,
   toolResultsAppendPruned: 0,
   toolResultsTruncated: 0,
   contextPasses: 0,
@@ -555,6 +557,21 @@ function findAppendedSeenOutput(text: string, toolName: string): AppendMatch | u
   return findAppendedOutput(text, toolName, [...seenOutputs.values()]);
 }
 
+function findNormalizedDuplicateSeenOutput(text: string, toolName: string): { prior: SeenOutput; fingerprint: ReturnType<typeof appendFingerprint> } | undefined {
+  const fingerprint = appendFingerprint(text);
+  if (fingerprint.normalizedChars < config.minDuplicateChars) return undefined;
+
+  for (const prior of seenOutputs.values()) {
+    if (prior.toolName !== toolName) continue;
+    if (prior.normalizedHash !== fingerprint.normalizedHash) continue;
+    if (prior.normalizedChars !== fingerprint.normalizedChars) continue;
+    if (prior.normalizedLineCount !== fingerprint.normalizedLineCount) continue;
+    return { prior, fingerprint };
+  }
+
+  return undefined;
+}
+
 function appendedReplacement(text: string, toolName: string, match: AppendMatch): { text: string; saved: number } {
   const start = Math.max(0, Math.min(match.startBoundary, text.length));
   const end = Math.max(start, Math.min(match.endBoundary, text.length));
@@ -571,6 +588,21 @@ function appendedReplacement(text: string, toolName: string, match: AppendMatch)
   return {
     text: `${prefix}${header}${suffixTrimmed.text}`,
     saved: Math.max(0, omittedChars - header.length) + suffixTrimmed.saved,
+  };
+}
+
+function persistedTruncation(text: string, maxChars: number, toolName: string): { text: string; saved: number; hash: string } {
+  const hash = hashText(text);
+  if (text.length <= maxChars) return { text, saved: 0, hash };
+
+  const marker = `\n\n[cprune: omitted ${text.length - maxChars} chars from ${toolName} result before persistence; hash=${shortHash(hash)}; original=${text.length} chars.]\n\n`;
+  const room = Math.max(0, maxChars - marker.length);
+  const head = Math.ceil(room * 0.65);
+  const tail = Math.max(0, room - head);
+  return {
+    text: `${text.slice(0, head)}${marker}${tail > 0 ? text.slice(-tail) : ""}`,
+    saved: text.length - maxChars,
+    hash,
   };
 }
 
@@ -1515,6 +1547,7 @@ function statusText(ctx?: any): string {
     "Persist-time pruning",
     `  tool results seen        : ${fmtInt(stats.toolResultsSeen)}`,
     `  exact duplicates         : ${fmtInt(stats.toolResultsDeduped)}`,
+    `  normalized duplicates    : ${fmtInt(stats.toolResultsNormalizedDeduped)}`,
     `  append-pruned            : ${fmtInt(stats.toolResultsAppendPruned)}`,
     `  oversized truncated      : ${fmtInt(stats.toolResultsTruncated)}`,
     "",
@@ -1626,6 +1659,25 @@ export default function cprune(pi: ExtensionAPI) {
         };
       }
 
+      const normalizedDuplicate = findNormalizedDuplicateSeenOutput(fullText, event.toolName);
+      if (normalizedDuplicate) {
+        stats.toolResultsNormalizedDeduped++;
+        const replacement = `[cprune: normalized duplicate ${event.toolName} result omitted. Same content after ANSI/CRLF/trailing-whitespace normalization first seen for ${normalizedDuplicate.prior.toolName}(${normalizedDuplicate.prior.input}); normalizedHash=${shortHash(normalizedDuplicate.fingerprint.normalizedHash)}; rawHash=${shortHash(hash)}; original length=${fullText.length} chars.]`;
+        mergeStats(Math.max(0, fullText.length - replacement.length));
+        return {
+          content: textContent(replacement),
+          details: {
+            ...(typeof event.details === "object" && event.details ? event.details : {}),
+            cprune: {
+              pruned: "normalized-duplicate",
+              normalizedHash: normalizedDuplicate.fingerprint.normalizedHash,
+              hash,
+              originalChars: fullText.length,
+            },
+          },
+        };
+      }
+
       const appended = findAppendedSeenOutput(fullText, event.toolName);
       rememberOutput(hash, event.toolName, event.input, fullText.length, fullText);
       if (appended) {
@@ -1649,7 +1701,7 @@ export default function cprune(pi: ExtensionAPI) {
     }
 
     const limit = event.toolName === "bash" ? config.maxPersistedToolResultChars + 4_000 : config.maxPersistedToolResultChars;
-    const truncated = truncateMiddle(fullText, limit, `${event.toolName} result before persistence`);
+    const truncated = persistedTruncation(fullText, limit, event.toolName);
     if (truncated.saved > 0) {
       stats.toolResultsTruncated++;
       mergeStats(truncated.saved);
@@ -1657,7 +1709,7 @@ export default function cprune(pi: ExtensionAPI) {
         content: textContent(truncated.text),
         details: {
           ...(typeof event.details === "object" && event.details ? event.details : {}),
-          cprune: { pruned: "truncated", originalChars: fullText.length, keptChars: truncated.text.length },
+          cprune: { pruned: "truncated", hash: truncated.hash, originalChars: fullText.length, keptChars: truncated.text.length },
         },
       };
     }

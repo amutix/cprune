@@ -8,17 +8,20 @@ Entity-aware pruning is generic rather than tied to one extension: it detects ID
 
 ## Safety and information loss
 
-cprune's normal pruning is non-destructive: it does not rewrite Pi's active session files or delete history. It changes only the context sent to the model for a request, so the original session remains available to Pi and can still be inspected or resumed.
+cprune has two pruning points:
 
-However, cprune should not be described as lossless at prompt time. Some rules intentionally replace older details with hashes, IDs, previews, and re-run hints. This reduces token use, but the model may no longer see every historical byte in the immediate request.
+- **Persist-time pruning** runs on new tool results before Pi stores them. This is intentionally conservative and limited to mechanical cases: exact duplicates, normalized duplicates where only ANSI/CRLF/trailing whitespace differ, append/prefix repeats, and oversized tool results with hash/original-size metadata plus retained head/tail preview.
+- **Prompt-time pruning** runs before a model request. It is non-destructive to Pi's active session files, but can be more aggressive because it only changes the context sent to the model for that request.
+
+cprune should not be described as fully lossless. Persist-time pruning is near-lossless but still replaces bytes in saved tool results for the safe cases above. Prompt-time pruning may replace older details with hashes, IDs, previews, and re-run hints. This reduces token use, but the model may no longer see every historical byte in the immediate request.
 
 Risk levels:
 
-- Low risk / near-lossless: exact duplicates, exact append/prefix repeats, and repeated chunks where a newer full copy remains.
+- Low risk / near-lossless: exact duplicates, normalized duplicates, exact append/prefix repeats, and repeated chunks where a newer full copy remains.
 - Medium risk: stale file-read pruning, superseded entity/tool-result pruning, structured notice compaction, and historical tool-call argument compaction.
 - Explicitly lossy: old assistant thinking removal, latest-entity-snapshot-wins summaries, and `/cprune compact`.
 
-Recommended wording: cprune is **non-destructive but lossy-at-prompt-time**. It preserves recent context, errors, entity IDs, hashes, previews, and re-run hints, but it may remove historical details from the model request.
+Recommended wording: cprune uses **conservative near-lossless persist-time pruning** plus **non-destructive but lossy-at-prompt-time pruning**. It preserves recent context, errors, entity IDs, hashes, previews, and re-run hints, but it may remove historical details from saved tool results in safe mechanical cases and from the model request in broader prompt-time cases.
 
 ## Use
 
