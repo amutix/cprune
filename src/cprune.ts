@@ -1481,6 +1481,7 @@ function fmtPct(value: number): string {
 }
 
 const PARTIAL_BLOCKS = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+const BRIGHT_TEXT = "\x1b[22m\x1b[39m";
 
 function blockBar(value: number, max: number, width: number): { filled: string; padding: string } {
   if (max <= 0 || value <= 0) return { filled: "", padding: " ".repeat(width) };
@@ -1647,7 +1648,7 @@ function contextStatText(ctx: any): string {
   const fullPct = off.before.chars > 0 ? (fullSaved / off.before.chars) * 100 : 0;
 
   return [
-    "cprune",
+    `${BRIGHT_TEXT}cprune`,
     "",
     "Summary",
     `  active mode       : ${mode}`,
