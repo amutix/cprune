@@ -23,8 +23,9 @@ type OutputFingerprint = SeenOutput & { index?: number };
 
 type AppendMatch = {
   prior: OutputFingerprint;
-  boundary: number;
-  kind: "exact-prefix" | "normalized-prefix";
+  startBoundary: number;
+  endBoundary: number;
+  kind: "exact-prefix" | "normalized-prefix" | "normalized-contained";
 };
 
 type CpruneStats = {
@@ -37,6 +38,7 @@ type CpruneStats = {
   contextStaleReads: number;
   contextDuplicates: number;
   contextAppendPruned: number;
+  contextSupersededCommands: number;
   contextTruncations: number;
   thinkingBlocksDropped: number;
   approxCharsSaved: number;
@@ -72,6 +74,7 @@ const stats: CpruneStats = {
   contextStaleReads: 0,
   contextDuplicates: 0,
   contextAppendPruned: 0,
+  contextSupersededCommands: 0,
   contextTruncations: 0,
   thinkingBlocksDropped: 0,
   approxCharsSaved: 0,
@@ -128,6 +131,24 @@ function rawBoundaryAfterNormalizedLines(text: string, lineCount: number): numbe
     }
   }
   return text.length;
+}
+
+function rawLineStart(text: string, lineIndex: number): number {
+  if (lineIndex <= 0) return 0;
+  let seenNewlines = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "\n") {
+      seenNewlines++;
+      if (seenNewlines === lineIndex) return i + 1;
+    }
+  }
+  return text.length;
+}
+
+function isSnapshotCommand(command: unknown): boolean {
+  if (typeof command !== "string") return false;
+  const normalized = command.trim().replace(/\s+/g, " ");
+  return /^(ls|find|rg|grep|wc|git status|git diff(?!\s+apply\b)|git ls-files|git grep)\b/.test(normalized);
 }
 
 function safeJson(value: unknown, max = 220): string {
@@ -213,7 +234,7 @@ function findAppendedOutput(text: string, toolName: string, candidates: OutputFi
 
   for (const seen of exactCandidates) {
     if (hashText(text.slice(0, seen.chars)) === seen.hash) {
-      return { prior: seen, boundary: seen.chars, kind: "exact-prefix" };
+      return { prior: seen, startBoundary: 0, endBoundary: seen.chars, kind: "exact-prefix" };
     }
   }
 
@@ -236,9 +257,33 @@ function findAppendedOutput(text: string, toolName: string, candidates: OutputFi
     if (hashText(currentFp.normalizedText.slice(0, normalizedChars)) === seen.normalizedHash) {
       return {
         prior: seen,
-        boundary: rawBoundaryAfterNormalizedLines(text, seen.normalizedLineCount ?? 0),
+        startBoundary: 0,
+        endBoundary: rawBoundaryAfterNormalizedLines(text, seen.normalizedLineCount ?? 0),
         kind: "normalized-prefix",
       };
+    }
+  }
+
+  // Third pass: contained normalized block. This catches wrappers like
+  // "command header + previous output + appended tail". It is deliberately
+  // limited to substantial multi-line outputs to avoid over-pruning short snippets.
+  const currentLines = normalizedLinesForAppend(text);
+  const containedCandidates = normalizedCandidates.filter((seen) => (seen.normalizedLineCount ?? 0) >= 20);
+  for (const seen of containedCandidates) {
+    const lineCount = seen.normalizedLineCount ?? 0;
+    const maxStart = currentLines.length - lineCount;
+    if (maxStart <= 0) continue;
+
+    for (let startLine = 1; startLine <= maxStart; startLine++) {
+      const windowHash = hashText(currentLines.slice(startLine, startLine + lineCount).join("\n"));
+      if (windowHash === seen.normalizedHash) {
+        return {
+          prior: seen,
+          startBoundary: rawLineStart(text, startLine),
+          endBoundary: rawBoundaryAfterNormalizedLines(text, startLine + lineCount),
+          kind: "normalized-contained",
+        };
+      }
     }
   }
 
@@ -250,16 +295,20 @@ function findAppendedSeenOutput(text: string, toolName: string): AppendMatch | u
 }
 
 function appendedReplacement(text: string, toolName: string, match: AppendMatch): { text: string; saved: number } {
-  const omittedChars = Math.min(match.boundary, text.length);
-  const suffix = text.slice(omittedChars);
+  const start = Math.max(0, Math.min(match.startBoundary, text.length));
+  const end = Math.max(start, Math.min(match.endBoundary, text.length));
+  const omittedChars = end - start;
+  const prefix = text.slice(0, start);
+  const suffix = text.slice(end);
   const suffixTrimmed = truncateMiddle(suffix, config.maxAppendedSuffixChars, `newly appended ${toolName} output`);
+  const location = start === 0 ? "prefix" : "contained block";
   const header =
     match.prior.index === undefined
-      ? `[cprune: omitted ${omittedChars} repeated prefix chars from ${toolName} result; match=${match.kind}; prefix hash=${shortHash(match.prior.hash)}; first input=${match.prior.input}. Newly appended output follows.]\n`
-      : `[cprune: omitted ${omittedChars} repeated prefix chars from ${toolName} result; match=${match.kind}; same prefix appeared at message index ${match.prior.index}; prefix hash=${shortHash(match.prior.hash)}. Newly appended output follows.]\n`;
+      ? `[cprune: omitted ${omittedChars} repeated ${location} chars from ${toolName} result; match=${match.kind}; hash=${shortHash(match.prior.hash)}; first input=${match.prior.input}. New/non-repeated output follows.]\n`
+      : `[cprune: omitted ${omittedChars} repeated ${location} chars from ${toolName} result; match=${match.kind}; same block appeared at message index ${match.prior.index}; hash=${shortHash(match.prior.hash)}. New/non-repeated output follows.]\n`;
 
   return {
-    text: `${header}${suffixTrimmed.text}`,
+    text: `${prefix}${header}${suffixTrimmed.text}`,
     saved: Math.max(0, omittedChars - header.length) + suffixTrimmed.saved,
   };
 }
@@ -362,6 +411,7 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
   const recentStart = Math.max(0, messages.length - config.keepRecentMessagesUntouched);
   const latestReadByPath = new Map<string, number>();
   const latestMutationByPath = new Map<string, number>();
+  const latestSnapshotCommand = new Map<string, number>();
 
   messages.forEach((message, index) => {
     if (message?.role === "toolResult") {
@@ -369,6 +419,9 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
       if (call?.name === "read") {
         const path = normalizePath(call.args.path);
         if (path && !message.isError) latestReadByPath.set(path, index);
+      }
+      if (call?.name === "bash" && !message.isError && isSnapshotCommand(call.args.command)) {
+        latestSnapshotCommand.set(String(call.args.command).trim(), index);
       }
     }
 
@@ -424,6 +477,23 @@ function pruneContextMessages(messages: AnyMessage[]): AnyMessage[] {
             `[cprune: stale read result omitted for ${path}; ${reason}. Re-read the file if exact old contents are needed.]`,
           );
         }
+      }
+    }
+
+    // Superseded read-only snapshot commands. If an old `rg`, `find`, `ls`,
+    // `git status`, etc. command was run again later, the newer snapshot is
+    // usually the one that matters. Keep structure, omit the old bulk.
+    if (toolName === "bash" && isSnapshotCommand(call?.args.command)) {
+      const command = String(call?.args.command).trim();
+      const newerRun = latestSnapshotCommand.get(command);
+      if (newerRun !== undefined && newerRun > index) {
+        stats.contextSupersededCommands++;
+        touched++;
+        mergeStats(Math.max(0, fullText.length - 180));
+        return cloneWithText(
+          current,
+          `[cprune: superseded ${toolName} result omitted; command was run again at message index ${newerRun}. Command: ${command}]`,
+        );
       }
     }
 
@@ -570,6 +640,7 @@ function contextStatText(ctx: any): string {
     staleReads: stats.contextStaleReads - snapshot.contextStaleReads,
     duplicates: stats.contextDuplicates - snapshot.contextDuplicates,
     appendPruned: stats.contextAppendPruned - snapshot.contextAppendPruned,
+    supersededCommands: stats.contextSupersededCommands - snapshot.contextSupersededCommands,
     truncations: stats.contextTruncations - snapshot.contextTruncations,
     thinkingBlocks: stats.thinkingBlocksDropped - snapshot.thinkingBlocksDropped,
     touched: stats.contextMessagesTouched - snapshot.contextMessagesTouched,
@@ -595,7 +666,8 @@ function contextStatText(ctx: any): string {
     `messages touched: ${passDelta.touched}`,
     `stale reads: ${passDelta.staleReads}`,
     `exact duplicates: ${passDelta.duplicates}`,
-    `append-only repeats: ${passDelta.appendPruned}`,
+    `append/contained repeats: ${passDelta.appendPruned}`,
+    `superseded snapshot commands: ${passDelta.supersededCommands}`,
     `oversized old results truncated: ${passDelta.truncations}`,
     `old thinking blocks dropped: ${passDelta.thinkingBlocks}`,
     `pass-estimated saved chars by rules: ${passDelta.saved.toLocaleString()}`,
@@ -620,7 +692,8 @@ function statusText(ctx?: any): string {
     `context passes: ${stats.contextPasses}`,
     `context stale reads pruned: ${stats.contextStaleReads}`,
     `context duplicate results pruned: ${stats.contextDuplicates}`,
-    `context append-pruned results: ${stats.contextAppendPruned}`,
+    `context append/contained-pruned results: ${stats.contextAppendPruned}`,
+    `context superseded snapshot commands: ${stats.contextSupersededCommands}`,
     `context old tool results truncated: ${stats.contextTruncations}`,
     `assistant thinking blocks dropped from old context: ${stats.thinkingBlocksDropped}`,
     `auto compactions triggered: ${stats.compactionsTriggered}`,
@@ -704,7 +777,7 @@ export default function cprune(pi: ExtensionAPI) {
               pruned: "appended",
               match: appended.kind,
               prefixHash: appended.prior.hash,
-              omittedPrefixChars: appended.boundary,
+              omittedRepeatedChars: appended.endBoundary - appended.startBoundary,
               originalChars: fullText.length,
             },
           },
