@@ -1386,7 +1386,7 @@ function statusText(ctx?: any): string {
   ].join("\n");
 }
 
-function cpruneApplyInstructions(reason: string): string {
+function cpruneCompactInstructions(reason: string): string {
   return `cprune ${reason}: create a compact continuation summary that removes duplicate/stale details. Preserve only information needed to continue safely: current user goal, explicit user instructions, decisions, constraints, modified/read files, entity IDs and latest states, blockers/errors, and next steps. Do not preserve repeated tool outputs, stale file snapshots superseded by newer reads/edits, duplicate entity notifications, or verbose historical comments unless they contain unique current instructions or unresolved errors.`;
 }
 
@@ -1415,7 +1415,7 @@ function maybeTriggerCompaction(ctx: any) {
   stats.compactionsTriggered++;
 
   ctx.compact({
-    customInstructions: cpruneApplyInstructions("background apply"),
+    customInstructions: cpruneCompactInstructions("background compaction"),
     onComplete: () => {
       compactInFlight = false;
       ctx.ui.notify("cprune: background compaction completed", "info");
@@ -1509,7 +1509,7 @@ export default function cprune(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cprune", {
-    description: "Control cprune: /cprune on|off|status|stats|apply",
+    description: "Control cprune: /cprune on|off|status|stats|compact",
     handler: async (args, ctx) => {
       const action = args.trim() || "status";
 
@@ -1539,15 +1539,15 @@ export default function cprune(pi: ExtensionAPI) {
         return;
       }
 
-      if (action === "apply" || action === "compact") {
+      if (action === "compact") {
         ctx.compact({
-          customInstructions: cpruneApplyInstructions("manual apply"),
-          onComplete: () => ctx.ui.notify("cprune: apply completed (persistent compaction added)", "info"),
-          onError: (error) => ctx.ui.notify(`cprune: apply failed: ${error.message}`, "warning"),
+          customInstructions: cpruneCompactInstructions("manual compaction"),
+          onComplete: () => ctx.ui.notify("cprune: compaction completed (lossy summary added)", "info"),
+          onError: (error) => ctx.ui.notify(`cprune: compaction failed: ${error.message}`, "warning"),
         });
         return;
       }
-      ctx.ui.notify("Usage: /cprune [on|off|status|stats|apply]", "warning");
+      ctx.ui.notify("Usage: /cprune [on|off|status|stats|compact]", "warning");
     },
   });
 
@@ -1555,12 +1555,12 @@ export default function cprune(pi: ExtensionAPI) {
     name: "cprune_status",
     label: "cprune status",
     description:
-      "Control cprune and inspect pruning impact. Supports status, stats, on, off, and apply actions.",
+      "Control cprune and inspect pruning impact. Supports status, stats, on, off, and compact actions.",
     promptSnippet: "Control cprune and report pruning status/statistics",
     promptGuidelines: [
       "Use cprune_status with action=\"stats\" when the user asks whether cprune is saving context or whether pruning is effective.",
       "Use cprune_status with action=\"on\" or action=\"off\" when the user asks to enable or disable cprune pruning.",
-      "Use cprune_status with action=\"apply\" when the user asks to persistently apply cprune pruning via Pi compaction.",
+      "Use cprune_status with action=\"compact\" when the user asks to persistently compact/prune context via Pi compaction. This is lossy summarization.",
     ],
     parameters: Type.Object({
       action: Type.Optional(
@@ -1572,12 +1572,11 @@ export default function cprune(pi: ExtensionAPI) {
             Type.Literal("context-stat"),
             Type.Literal("on"),
             Type.Literal("off"),
-            Type.Literal("apply"),
             Type.Literal("compact"),
           ],
           {
             description:
-              "status: cumulative counters; stats: simulate raw vs pruned context; on/off: enable or disable pruning; apply: request persistent cprune-focused compaction. compact is accepted as an alias."
+              "status: cumulative counters; stats: simulate raw vs pruned context; on/off: enable or disable pruning; compact: request persistent cprune-focused lossy compaction.",
           },
         ),
       ),
@@ -1609,12 +1608,12 @@ export default function cprune(pi: ExtensionAPI) {
         };
       }
 
-      if (action === "apply" || action === "compact") {
+      if (action === "compact") {
         ctx.compact({
-          customInstructions: cpruneApplyInstructions("tool apply"),
+          customInstructions: cpruneCompactInstructions("tool compaction"),
         });
         return {
-          content: textContent("cprune: apply requested (persistent compaction will be added)"),
+          content: textContent("cprune: compact requested (lossy persistent compaction will be added)"),
           details: { enabled, stats },
         };
       }
