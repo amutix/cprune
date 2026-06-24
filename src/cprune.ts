@@ -91,6 +91,7 @@ const config = {
   minRepeatedChunkChars: 1_200,
   maxSeenHashes: 300,
   maxReviewCandidates: 20,
+  reviewCommandPageSize: 14,
 
   // Background compaction trigger. Set to 0 to disable.
   autoCompactAtPercent: 82,
@@ -1830,31 +1831,55 @@ async function reviewCommandTurns(ctx: any, pi: ExtensionAPI, limit: number) {
     return;
   }
 
-  const options = candidates.map(turnCandidateOption);
-  options.push("Cancel");
-  const choice = await ctx.ui.select(`cprune: choose a prompt/response turn to exclude (last ${limit} prompts)`, options);
-  if (!choice || choice === "Cancel") return;
+  const pageSize = config.reviewCommandPageSize;
+  let page = 0;
 
-  const index = options.indexOf(choice);
-  const candidate = candidates[index];
-  if (!candidate) return;
+  while (true) {
+    const start = page * pageSize;
+    const pageCandidates = candidates.slice(start, start + pageSize);
+    const totalPages = Math.max(1, Math.ceil(candidates.length / pageSize));
+    const candidateOptions = pageCandidates.map(turnCandidateOption);
+    const options = [...candidateOptions];
+    if (page > 0) options.push("← Previous newer prompts");
+    if (start + pageSize < candidates.length) options.push("Next older prompts →");
+    options.push("Cancel");
 
-  const ok = await ctx.ui.confirm(
-    "Exclude this prompt/response turn?",
-    `${candidate.label}\nmessages #${candidate.start}-${candidate.end}\n${fmtInt(candidate.chars)} chars\n\nThis is non-destructive: cprune will omit the selected user prompt and its response/tool-results at prompt time, but it will not rewrite Pi session history.`,
-  );
-  if (!ok) return;
+    const choice = await ctx.ui.select(
+      `cprune: choose a prompt/response turn to exclude (page ${page + 1}/${totalPages}, last ${limit} prompts)`,
+      options,
+    );
+    if (!choice || choice === "Cancel") return;
+    if (choice === "← Previous newer prompts") {
+      page = Math.max(0, page - 1);
+      continue;
+    }
+    if (choice === "Next older prompts →") {
+      page = Math.min(totalPages - 1, page + 1);
+      continue;
+    }
 
-  manualTurnOmissions.set(candidate.hash, {
-    hash: candidate.hash,
-    label: candidate.label,
-    chars: candidate.chars,
-    messageCount: candidate.messageCount,
-    preview: candidate.preview,
-    createdAt: Date.now(),
-  });
-  saveState(pi);
-  ctx.ui.notify(`cprune: excluded ${candidate.label} from future prompts`, "info");
+    const index = candidateOptions.indexOf(choice);
+    const candidate = pageCandidates[index];
+    if (!candidate) return;
+
+    const ok = await ctx.ui.confirm(
+      "Exclude this prompt/response turn?",
+      `${candidate.label}\nmessages #${candidate.start}-${candidate.end}\n${fmtInt(candidate.chars)} chars\n\nThis is non-destructive: cprune will omit the selected user prompt and its response/tool-results at prompt time, but it will not rewrite Pi session history.`,
+    );
+    if (!ok) continue;
+
+    manualTurnOmissions.set(candidate.hash, {
+      hash: candidate.hash,
+      label: candidate.label,
+      chars: candidate.chars,
+      messageCount: candidate.messageCount,
+      preview: candidate.preview,
+      createdAt: Date.now(),
+    });
+    saveState(pi);
+    ctx.ui.notify(`cprune: excluded ${candidate.label} from future prompts`, "info");
+    return;
+  }
 }
 
 async function reviewLargeContext(ctx: any, pi: ExtensionAPI) {
