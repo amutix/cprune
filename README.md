@@ -18,7 +18,7 @@ Or install/configure it as a Pi package; `package.json` exposes `src/cprune.ts` 
 
 ```text
 /cprune status        Show cumulative pruning counters
-/cprune context-stat  Compare raw context vs simulated cprune-pruned context
+/cprune stats         Compare raw context vs simulated cprune-pruned context
 /cprune on            Enable pruning
 /cprune off           Disable pruning
 /cprune compact       Trigger cprune-focused compaction
@@ -30,12 +30,12 @@ cprune also registers an LLM-callable tool named `cprune_status` with actions:
 
 ```text
 status        Show cumulative pruning counters
-context-stat  Compare raw context vs simulated cprune-pruned context
+stats         Compare raw context vs simulated cprune-pruned context
 on            Enable pruning
 off           Disable pruning
 compact       Trigger cprune-focused compaction
 ```
 
-`/cprune context-stat` and `cprune_status action="context-stat"` work whether pruning is on or off, so you can compare estimated savings before enabling it. The output includes grouped sections, orange before / green after total bars, before/after breakdown by context part, per-rule hit counts, and per-rule character savings.
+`/cprune stats` and `cprune_status action="stats"` work whether pruning is on or off, so you can compare estimated savings before enabling it. (`stat` and the old `context-stat` action are accepted as aliases.) The output includes grouped sections, orange before / green after total bars, before/after breakdown by context part, per-rule hit counts, and per-rule character savings.
 
 Note: turning pruning off prevents future pruning. It does not reconstruct tool outputs that were already pruned before persistence.

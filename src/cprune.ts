@@ -808,7 +808,7 @@ function currentContextMessages(ctx: any): AnyMessage[] {
   if (Array.isArray(built?.messages)) return built.messages;
 
   // Fallback for older SDK shapes. This is less exact because it does not convert
-  // compaction/custom entries, but keeps /cprune context-stat useful.
+  // compaction/custom entries, but keeps /cprune stats useful.
   const branch = ctx.sessionManager?.getBranch?.() ?? [];
   return branch
     .map((entry: any) => {
@@ -941,7 +941,7 @@ function contextStatText(ctx: any): string {
   const afterPct = before.chars > 0 ? (after.chars / before.chars) * 100 : 0;
 
   return [
-    "cprune context-stat",
+    "cprune stats",
     "",
     "Summary",
     `  pruning           : ${enabled ? "on" : "off"}`,
@@ -1145,7 +1145,7 @@ export default function cprune(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cprune", {
-    description: "Control cprune: /cprune on|off|status|context-stat|compact",
+    description: "Control cprune: /cprune on|off|status|stats|compact",
     handler: async (args, ctx) => {
       const action = args.trim() || "status";
 
@@ -1161,7 +1161,7 @@ export default function cprune(pi: ExtensionAPI) {
         enabled = false;
         ctx.ui.setStatus("cprune", "cprune: off");
         saveState(pi);
-        ctx.ui.notify("cprune: pruning disabled. /cprune context-stat still simulates potential savings.", "info");
+        ctx.ui.notify("cprune: pruning disabled. /cprune stats still simulates potential savings.", "info");
         return;
       }
 
@@ -1170,7 +1170,7 @@ export default function cprune(pi: ExtensionAPI) {
         return;
       }
 
-      if (action === "context-stat") {
+      if (action === "stats" || action === "stat" || action === "context-stat") {
         ctx.ui.notify(contextStatText(ctx), "info");
         return;
       }
@@ -1184,7 +1184,7 @@ export default function cprune(pi: ExtensionAPI) {
         });
         return;
       }
-      ctx.ui.notify("Usage: /cprune [on|off|status|context-stat|compact]", "warning");
+      ctx.ui.notify("Usage: /cprune [on|off|status|stats|compact]", "warning");
     },
   });
 
@@ -1192,10 +1192,10 @@ export default function cprune(pi: ExtensionAPI) {
     name: "cprune_status",
     label: "cprune status",
     description:
-      "Control cprune and inspect pruning impact. Supports status, context-stat, on, off, and compact actions.",
-    promptSnippet: "Control cprune and report pruning status/context-statistics",
+      "Control cprune and inspect pruning impact. Supports status, stats, on, off, and compact actions.",
+    promptSnippet: "Control cprune and report pruning status/statistics",
     promptGuidelines: [
-      "Use cprune_status with action=\"context-stat\" when the user asks whether cprune is saving context or whether pruning is effective.",
+      "Use cprune_status with action=\"stats\" when the user asks whether cprune is saving context or whether pruning is effective.",
       "Use cprune_status with action=\"on\" or action=\"off\" when the user asks to enable or disable cprune pruning.",
     ],
     parameters: Type.Object({
@@ -1203,6 +1203,8 @@ export default function cprune(pi: ExtensionAPI) {
         Type.Union(
           [
             Type.Literal("status"),
+            Type.Literal("stats"),
+            Type.Literal("stat"),
             Type.Literal("context-stat"),
             Type.Literal("on"),
             Type.Literal("off"),
@@ -1210,7 +1212,7 @@ export default function cprune(pi: ExtensionAPI) {
           ],
           {
             description:
-              "status: cumulative counters; context-stat: simulate raw vs pruned context; on/off: enable or disable pruning; compact: request focused compaction.",
+              "status: cumulative counters; stats: simulate raw vs pruned context; on/off: enable or disable pruning; compact: request focused compaction. stat and context-stat are accepted aliases."
           },
         ),
       ),
@@ -1230,12 +1232,12 @@ export default function cprune(pi: ExtensionAPI) {
         ctx.ui.setStatus("cprune", "cprune: off");
         saveState(pi);
         return {
-          content: textContent("cprune: pruning disabled. cprune_status action=\"context-stat\" still simulates potential savings."),
+          content: textContent("cprune: pruning disabled. cprune_status action=\"stats\" still simulates potential savings."),
           details: { enabled, stats },
         };
       }
 
-      if (action === "context-stat") {
+      if (action === "stats" || action === "stat" || action === "context-stat") {
         return {
           content: textContent(contextStatText(ctx)),
           details: { enabled, stats, seenOutputHashes: seenOutputs.size },
