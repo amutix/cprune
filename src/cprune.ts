@@ -91,7 +91,7 @@ const config = {
   minRepeatedChunkChars: 1_200,
   maxSeenHashes: 300,
   maxReviewCandidates: 20,
-  reviewCommandPageSize: 14,
+  reviewCommandPageSize: 10,
 
   // Background compaction trigger. Set to 0 to disable.
   autoCompactAtPercent: 82,
@@ -1789,8 +1789,24 @@ type TurnCandidate = {
   preview: string;
 };
 
+function reviewHistoryMessages(ctx: any): AnyMessage[] {
+  const branch = ctx.sessionManager?.getBranch?.();
+  if (!Array.isArray(branch) || branch.length === 0) return currentContextMessages(ctx);
+  return branch
+    .map((entry: any) => {
+      if (entry.type === "message") return entry.message;
+      if (entry.type === "custom_message") {
+        return { role: "custom", customType: entry.customType, content: entry.content, display: entry.display, details: entry.details };
+      }
+      if (entry.type === "compaction") return { role: "compactionSummary", summary: entry.summary };
+      if (entry.type === "branch_summary") return { role: "branchSummary", summary: entry.summary };
+      return undefined;
+    })
+    .filter(Boolean);
+}
+
 function turnCandidates(ctx: any, limit: number): TurnCandidate[] {
-  const messages = currentContextMessages(ctx);
+  const messages = reviewHistoryMessages(ctx);
   const starts = messages
     .map((message, index) => (message?.role === "user" ? index : -1))
     .filter((index) => index >= 0)
@@ -1824,7 +1840,7 @@ function turnCandidateOption(candidate: TurnCandidate): string {
   return `${fmtInt(candidate.chars).padStart(8)} chars | #${candidate.start}-${candidate.end} ${candidate.messageCount} msgs | ${candidate.preview.replace(/\s+/g, " ").slice(0, 100)}`;
 }
 
-async function reviewCommandTurns(ctx: any, pi: ExtensionAPI, limit: number) {
+async function reviewCommandTurns(ctx: any, pi: ExtensionAPI, limit: number, startPage = 1) {
   const candidates = turnCandidates(ctx, limit);
   if (candidates.length === 0) {
     ctx.ui.notify(`cprune: no prompt/response turns found in last ${limit} prompts`, "info");
@@ -1832,7 +1848,7 @@ async function reviewCommandTurns(ctx: any, pi: ExtensionAPI, limit: number) {
   }
 
   const pageSize = config.reviewCommandPageSize;
-  let page = 0;
+  let page = Math.max(0, Math.min(Math.ceil(candidates.length / pageSize) - 1, startPage - 1));
 
   while (true) {
     const start = page * pageSize;
@@ -2095,8 +2111,9 @@ export default function cprune(pi: ExtensionAPI) {
       }
 
       if (action === "review-command" || action === "review-turns") {
-        const limit = Number.isFinite(Number(parts[1])) ? Math.max(1, Math.min(50, Math.floor(Number(parts[1])))) : 10;
-        await reviewCommandTurns(ctx, pi, limit);
+        const limit = Number.isFinite(Number(parts[1])) ? Math.max(1, Math.min(200, Math.floor(Number(parts[1])))) : 10;
+        const page = Number.isFinite(Number(parts[2])) ? Math.max(1, Math.floor(Number(parts[2]))) : 1;
+        await reviewCommandTurns(ctx, pi, limit, page);
         return;
       }
 
