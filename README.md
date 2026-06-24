@@ -39,7 +39,7 @@ Or install/configure it as a Pi package; `package.json` exposes `src/cprune.ts` 
 /cprune status             Show cumulative pruning counters
 /cprune stats              Compare raw context vs simulated cprune-pruned context
 /cprune review             Pick large older context entries to exclude from future prompts
-/cprune review-prompts [N] [page] Pick a prompt/response turn from history (default last 10, page 1)
+/cprune review-prompts [N] [page] Pick a prompt/response turn or visible !cmd from history
 /cprune clear-exclusions   Clear user-approved prompt-time exclusions
 /cprune on                 Enable pruning
 /cprune off                Disable pruning
@@ -60,6 +60,6 @@ compact       Lossily compact/prune context via Pi compaction
 
 `/cprune stats` and `cprune_status action="stats"` work whether pruning is on or off, so you can compare estimated savings before enabling it. (`stat` and the old `context-stat` action are accepted as aliases.) The output includes grouped sections, orange/green continuous bars, before/after breakdown by context part, per-rule hit counts, per-rule character savings, and any user-approved exclusions.
 
-`/cprune review-prompts [N] [page]` is useful after accidentally pushing a noisy prompt/response/tool-output turn into context. It reviews raw branch history, skips hidden Pi shell entries such as `!!cmd` because Pi marks them `excludeFromContext`, keeps normal `!cmd` entries, excludes the selected turn from future prompts when that turn appears in model context, and does not delete the underlying Pi session entries. Results are paginated; if the select UI cannot reach navigation options, jump directly with e.g. `/cprune review-prompts 50 2`.
+`/cprune review-prompts [N] [page]` is useful after accidentally pushing a noisy prompt/response/tool-output turn into context. It reviews raw branch history, skips hidden Pi shell entries such as `!!cmd` because Pi marks them `excludeFromContext`, keeps normal `!cmd` entries as selectable shell-command items, excludes the selected turn from future prompts when that turn appears in model context, and does not delete the underlying Pi session entries. Results are paginated; if the select UI cannot reach navigation options, jump directly with e.g. `/cprune review-prompts 50 2`.
 
 Note: `/cprune compact` is intentionally named compact because it is lossy summarization. It does not rewrite Pi session JSONL files in place; it uses Pi's compaction API to append a normal compaction entry, which is safer for Pi's append-only session/tree model. Turning pruning off prevents future pruning; it does not reconstruct tool outputs that were already pruned before persistence.

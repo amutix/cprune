@@ -1327,6 +1327,14 @@ function turnOmissionHash(turnMessages: AnyMessage[]): string {
   return hashText(`turn\n${turnMessages.map(stableMessageText).join("\n---\n")}`);
 }
 
+function isVisibleShellExecution(message: AnyMessage): boolean {
+  return message?.role === "bashExecution" && message.excludeFromContext !== true;
+}
+
+function isPromptReviewStart(message: AnyMessage): boolean {
+  return message?.role === "user" || isVisibleShellExecution(message);
+}
+
 function manualTurnOmissionReplacement(omission: ManualTurnOmission, actualChars: number): string {
   return `[cprune: user-excluded prompt/response turn omitted; label=${omission.label}; hash=${shortHash(omission.hash)}; messages=${omission.messageCount}; original=${actualChars} chars; preview=${JSON.stringify(omission.preview)}.]`;
 }
@@ -1338,14 +1346,16 @@ function applyManualTurnOmissions(messages: AnyMessage[]): { messages: AnyMessag
   let touched = 0;
   for (let index = 0; index < messages.length; ) {
     const message = messages[index];
-    if (message?.role !== "user") {
+    if (!isPromptReviewStart(message)) {
       result.push(message);
       index++;
       continue;
     }
 
     let end = index + 1;
-    while (end < messages.length && messages[end]?.role !== "user") end++;
+    if (!isVisibleShellExecution(message)) {
+      while (end < messages.length && !isPromptReviewStart(messages[end])) end++;
+    }
 
     const omitted = messages.slice(index, end);
     const omission = manualTurnOmissions.get(turnOmissionHash(omitted));
@@ -1811,14 +1821,16 @@ function reviewHistoryMessages(ctx: any): AnyMessage[] {
 function turnCandidates(ctx: any, limit: number): TurnCandidate[] {
   const messages = reviewHistoryMessages(ctx);
   const starts = messages
-    .map((message, index) => (message?.role === "user" ? index : -1))
+    .map((message, index) => (isPromptReviewStart(message) ? index : -1))
     .filter((index) => index >= 0)
     .slice(-Math.max(1, limit));
 
   return starts
     .map((start): TurnCandidate | undefined => {
       let end = start + 1;
-      while (end < messages.length && messages[end]?.role !== "user") end++;
+      if (!isVisibleShellExecution(messages[start])) {
+        while (end < messages.length && !isPromptReviewStart(messages[end])) end++;
+      }
       const turn = messages.slice(start, end);
       const userText = stableMessageText(messages[start]).trim();
       if (!userText) return undefined;
@@ -1829,7 +1841,7 @@ function turnCandidates(ctx: any, limit: number): TurnCandidate[] {
         start,
         end: end - 1,
         hash,
-        label: `#${start} prompt/response turn`,
+        label: isVisibleShellExecution(messages[start]) ? `#${start} shell command` : `#${start} prompt/response turn`,
         chars,
         messageCount: turn.length,
         preview: previewEntityText(userText, 180),
