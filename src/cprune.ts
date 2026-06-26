@@ -336,6 +336,26 @@ function isCoreToolName(toolName: string): boolean {
   return ["read", "bash", "edit", "write", "multi_tool_use.parallel"].includes(toolName);
 }
 
+function shouldPreserveHistoricalToolCallArgs(block: any): boolean {
+  const name = String(block?.name ?? "");
+  if (name === "edit" || name === "write") return true;
+
+  // Multi-tool calls may wrap edit/write calls. Preserve the whole wrapper so
+  // historical mutation arguments (especially exact oldText/newText pairs) stay
+  // available to the model for follow-up fixes and do not become cprune markers
+  // inside diffs or future edits.
+  if (name === "multi_tool_use.parallel") {
+    const toolUses = block?.arguments?.tool_uses;
+    return Array.isArray(toolUses)
+      && toolUses.some((toolUse: any) => {
+        const recipient = String(toolUse?.recipient_name ?? "");
+        return recipient === "functions.edit" || recipient === "functions.write" || recipient.endsWith(".edit") || recipient.endsWith(".write");
+      });
+  }
+
+  return false;
+}
+
 function stripBoilerplateNoticeTails(text: string): { text: string; saved: number; stripped: boolean } {
   const lines = text.split(/\r?\n/);
   const kept = lines.filter((line) => {
@@ -392,6 +412,8 @@ function toolEntityIds(toolName: string, text: string, args: unknown): string[] 
 }
 
 function compactHistoricalToolCall(block: any): { block: any; saved: number; pruned: boolean } {
+  if (shouldPreserveHistoricalToolCallArgs(block)) return { block, saved: 0, pruned: false };
+
   const args = block?.arguments ?? {};
   const original = safeJson(args, 40_000);
   if (original.length < config.minHistoricalToolCallArgChars) return { block, saved: 0, pruned: false };
@@ -834,6 +856,8 @@ function pruneAssistantContext(
     }
 
     if (block?.type === "toolCall" && successfulToolCallIds.has(block.id)) {
+      if (shouldPreserveHistoricalToolCallArgs(block)) return block;
+
       const compacted = compactHistoricalToolCall(block);
       if (compacted.pruned) {
         saved += compacted.saved;

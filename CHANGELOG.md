@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.2 - 2026-06-26
+
+### Fixed
+- Preserve historical `edit`/`write` tool-call arguments, including wrapped `multi_tool_use.parallel` edit/write calls. cprune no longer replaces exact `oldText`/`newText` mutation arguments with placeholders, avoiding corrupted follow-up edit context and noisy diffs.
+
 ## v0.2.1 - 2026-06-26
 
 ### Fixed
