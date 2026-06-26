@@ -163,6 +163,7 @@ const manualTurnOmissions = new Map<string, ManualTurnOmission>();
 let lastCompactAt = 0;
 let compactInFlight = false;
 let mode: CpruneMode = "full";
+let cpruneCompactionRequest: { reason: string; requestedAt: number } | undefined;
 
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex");
@@ -1885,6 +1886,85 @@ async function reviewLargeContext(ctx: any, pi: ExtensionAPI) {
   ctx.ui.notify(`cprune: excluded ${candidate.label} from future prompts`, "info");
 }
 
+function fileList(value: unknown): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return uniqueSorted(value.map(String));
+  if (value instanceof Set) return uniqueSorted([...value].map(String));
+  if (typeof value === "object") return uniqueSorted(Object.values(value as Record<string, unknown>).flatMap((item) => fileList(item)));
+  return typeof value === "string" ? [value] : [];
+}
+
+function compactMessageLine(message: AnyMessage, index: number): string {
+  const role = String(message?.role ?? "message");
+  const ids = extractEntityIds(stableMessageText(message));
+  const idText = ids.length ? ` [${ids.slice(0, 6).join(",")}]` : "";
+  const text = previewEntityText(stableMessageText(message), 260).replace(/\s+/g, " ").trim();
+  return `- ${index}: ${role}${idText}: ${text || "(no text)"}`;
+}
+
+function buildDeterministicCompaction(preparation: any, reason: string) {
+  const sourceMessages = [
+    ...(Array.isArray(preparation?.messagesToSummarize) ? preparation.messagesToSummarize : []),
+    ...(Array.isArray(preparation?.turnPrefixMessages) ? preparation.turnPrefixMessages : []),
+  ];
+  const pruneMode: CpruneMode = mode === "off" ? "safe" : mode;
+  const snapshot = cloneStats();
+  const pruned = pruneContextMessages(sourceMessages, pruneMode);
+  restoreStats(snapshot);
+
+  const userLines = pruned.filter((message) => message?.role === "user").slice(-8).map(compactMessageLine);
+  const recentLines = pruned.slice(-32).map(compactMessageLine);
+  const readFiles = uniqueSorted([...fileList(preparation?.fileOps?.readFiles), ...fileList(preparation?.fileOps?.reads)]).slice(0, 80);
+  const modifiedFiles = uniqueSorted([...fileList(preparation?.fileOps?.modifiedFiles), ...fileList(preparation?.fileOps?.writes)]).slice(0, 80);
+  const previous = typeof preparation?.previousSummary === "string"
+    ? truncateMiddle(preparation.previousSummary, 2_000, "previous compaction summary").text
+    : "";
+
+  const body = [
+    "## Goal",
+    userLines.at(-1) ?? "Continue the current conversation.",
+    "",
+    "## Context",
+    `cprune generated this deterministic compaction because normal LLM compaction can exceed the model context window on very large sessions. Source messages were pruned in ${pruneMode} mode before this summary was built.`,
+    previous ? `\n## Previous Summary\n${previous}` : "",
+    "",
+    "## Recent User Prompts",
+    ...(userLines.length ? userLines : ["- No recent user prompts found in summarized span."]),
+    "",
+    "## Recent Pruned Conversation Trace",
+    ...(recentLines.length ? recentLines : ["- No messages found in summarized span."]),
+    "",
+    "## Files",
+    `- Read: ${readFiles.length ? readFiles.join(", ") : "none detected"}`,
+    `- Modified: ${modifiedFiles.length ? modifiedFiles.join(", ") : "none detected"}`,
+    "",
+    "## Next Steps",
+    "- Continue from the unsummarized recent messages that Pi kept after this compaction.",
+    "- Re-read files or re-run commands when exact historical output is needed.",
+  ].filter(Boolean).join("\n");
+
+  return {
+    summary: truncateMiddle(body, 12_000, "cprune deterministic compaction summary").text,
+    firstKeptEntryId: preparation.firstKeptEntryId,
+    tokensBefore: preparation.tokensBefore,
+    details: {
+      readFiles,
+      modifiedFiles,
+      cprune: {
+        deterministic: true,
+        reason,
+        mode: pruneMode,
+        sourceMessages: sourceMessages.length,
+        prunedMessages: pruned.length,
+      },
+    },
+  };
+}
+
+function requestCpruneCompaction(reason: string) {
+  cpruneCompactionRequest = { reason, requestedAt: Date.now() };
+}
+
 function cpruneCompactInstructions(reason: string): string {
   return `cprune ${reason}: create a compact continuation summary that removes duplicate/stale details. Preserve only information needed to continue safely: current user goal, explicit user instructions, decisions, constraints, modified/read files, entity IDs and latest states, blockers/errors, and next steps. Do not preserve repeated tool outputs, stale file snapshots superseded by newer reads/edits, duplicate entity notifications, or verbose historical comments unless they contain unique current instructions or unresolved errors.`;
 }
@@ -1912,6 +1992,7 @@ function maybeTriggerCompaction(ctx: any) {
   compactInFlight = true;
   lastCompactAt = now;
   stats.compactionsTriggered++;
+  requestCpruneCompaction("background compaction");
 
   ctx.compact({
     customInstructions: cpruneCompactInstructions("background compaction"),
@@ -1934,6 +2015,19 @@ export default function cprune(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", () => {
     saveState(pi);
+  });
+
+  pi.on("session_before_compact", (event, ctx) => {
+    if (!cpruneCompactionRequest) return;
+    const request = cpruneCompactionRequest;
+    cpruneCompactionRequest = undefined;
+    if (Date.now() - request.requestedAt > 60_000) return;
+    try {
+      return { compaction: buildDeterministicCompaction(event.preparation, request.reason) };
+    } catch (error) {
+      ctx.ui.notify(`cprune: deterministic compaction fallback failed: ${(error as Error).message}`, "warning");
+      return undefined;
+    }
   });
 
   pi.on("tool_result", (event) => {
@@ -2088,6 +2182,7 @@ export default function cprune(pi: ExtensionAPI) {
       }
 
       if (action === "compact") {
+        requestCpruneCompaction("manual compaction");
         ctx.compact({
           customInstructions: cpruneCompactInstructions("manual compaction"),
           onComplete: () => ctx.ui.notify("cprune: compaction completed (lossy summary added)", "info"),
@@ -2149,6 +2244,7 @@ export default function cprune(pi: ExtensionAPI) {
       }
 
       if (action === "compact") {
+        requestCpruneCompaction("tool compaction");
         ctx.compact({
           customInstructions: cpruneCompactInstructions("tool compaction"),
         });

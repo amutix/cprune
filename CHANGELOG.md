@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.1 - 2026-06-26
+
+### Fixed
+
+- `/cprune compact` now provides a deterministic cprune summary through Pi's `session_before_compact` hook instead of asking the model to summarize the raw oversized session. This avoids `context_length_exceeded` failures when the normal Pi summarization request is already too large.
+- cprune compaction still uses Pi's supported compaction entry mechanism and remains lossy, but it no longer depends on fitting the full raw compaction input into the model context window.
+
 ## v0.2.0 - 2026-06-24
 
 First public release candidate for cprune as a Pi context-pruning extension.

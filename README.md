@@ -13,7 +13,7 @@ Entity-aware pruning is generic rather than tied to one extension: it detects ID
 - Conservative persist-time pruning handles exact/normalized duplicates, append repeats, and oversized tool results.
 - Prompt-time pruning removes stale, duplicate, oversized, or explicitly user-excluded context before model calls.
 - `/cprune review` and `/cprune review-prompts` let users explicitly exclude large entries or prompt/response turns without rewriting Pi history.
-- `/cprune compact` requests Pi's supported lossy compaction mechanism.
+- `/cprune compact` appends a supported Pi compaction entry using a deterministic cprune summary, avoiding model `context_length_exceeded` failures on very large sessions.
 
 ## Screenshot
 
@@ -79,4 +79,4 @@ cprune also registers an LLM-callable tool named `cprune_status`. Omitting `acti
 
 `/cprune review-prompts [safe|full] [N] [page]` is useful after accidentally pushing a noisy prompt/response/tool-output turn into context. Safe mode is the default and mirrors Pi prompt behavior: it skips hidden shell entries such as `!!cmd` because Pi marks them `excludeFromContext`, while keeping normal `!cmd` entries as selectable shell-command items. Full mode shows raw branch history, including hidden `!!cmd` entries, for users who want complete visibility. The selected turn is excluded from future prompts when it appears in model context; Pi session entries are not deleted. Results are paginated; jump directly with e.g. `/cprune review-prompts safe 50 2` or `/cprune review-prompts full 50`.
 
-Note: `/cprune compact` is intentionally named compact because it is lossy summarization. It does not rewrite Pi session JSONL files in place; it uses Pi's compaction API to append a normal compaction entry, which is safer for Pi's append-only session/tree model. Turning pruning off prevents future pruning; it does not reconstruct tool outputs that were already pruned before persistence.
+Note: `/cprune compact` is intentionally named compact because it is lossy summarization. It does not rewrite Pi session JSONL files in place; it uses Pi's `session_before_compact` hook to provide a deterministic cprune summary and append a normal compaction entry, which is safer for Pi's append-only session/tree model and avoids model context-window failures during summarization. Turning pruning off prevents future pruning; it does not reconstruct tool outputs that were already pruned before persistence.
