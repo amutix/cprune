@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.3 - 2026-06-26
+
+### Fixed
+- Added preserve guards for tool outputs and tool-call arguments that should not be omitted automatically: failed/error results, diagnostic failures, side-effectful shell commands, mutation tools, and non-repeatable browser/API-style tools.
+- This keeps cprune focused on mechanical waste while avoiding loss of state-changing, error-bearing, or hard-to-reproduce context.
+
 ## v0.2.2 - 2026-06-26
 
 ### Fixed

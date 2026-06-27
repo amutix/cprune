@@ -230,6 +230,44 @@ function isSnapshotCommand(command: unknown): boolean {
   return /^(ls|find|rg|grep|wc|git status|git diff(?!\s+apply\b)|git ls-files|git grep)\b/.test(normalized);
 }
 
+function commandText(input: unknown): string {
+  if (typeof input === "string") return input;
+  if (input && typeof input === "object" && typeof (input as Record<string, unknown>).command === "string") {
+    return String((input as Record<string, unknown>).command);
+  }
+  return "";
+}
+
+function isSideEffectfulShellCommand(command: unknown): boolean {
+  const normalized = commandText(command).trim().replace(/\s+/g, " ");
+  if (!normalized) return false;
+  if (/[;&|]\s*(rm|mv|cp|chmod|chown|mkdir|touch|tee)\b/.test(normalized)) return true;
+  if (/(^|\s)(>|>>|2>|2>>|&>)\s*\S+/.test(normalized)) return true;
+  return /^(rm|mv|cp|chmod|chown|mkdir|touch|tee|git (add|commit|push|pull|merge|rebase|reset|checkout|switch|clean|apply)|npm (install|i|ci|version|publish|pack)|pnpm (install|add|remove|update|publish)|yarn (install|add|remove|publish)|bun (install|add|remove)|pip install|cargo (fix|publish|install)|docker (run|rm|stop|kill|compose up|compose down)|kubectl (apply|delete|patch|scale|rollout|create)|terraform (apply|destroy|import)|prisma migrate|alembic upgrade|psql .*\b(insert|update|delete|create|drop|alter)\b)/i.test(normalized);
+}
+
+function looksFailureDiagnostic(text: string): boolean {
+  return /\b(fail(?:ed|ure)?|error|traceback|panic|fatal|exception|assertionerror|segmentation fault|command exited with code [1-9]|exit code [1-9]|tests? failed|failed tests?)\b/i.test(text);
+}
+
+function isMutationToolName(toolName: string): boolean {
+  return /(^|\.)(edit|write|apply_patch|patch|delete|remove|rename|move|create|update|deploy|publish|send)$/i.test(toolName)
+    || /^(edit|write|apply_patch|patch)$/i.test(toolName);
+}
+
+function isNonRepeatableToolName(toolName: string): boolean {
+  return /browser|playwright|puppeteer|api|oauth|auth|payment|deploy|publish/i.test(toolName);
+}
+
+function shouldPreserveToolResult(toolName: string, input: unknown, result: AnyMessage | { isError?: unknown }, text: string): boolean {
+  if (result?.isError) return true;
+  if (isMutationToolName(toolName)) return true;
+  if (toolName === "bash" && isSideEffectfulShellCommand(input)) return true;
+  if (looksFailureDiagnostic(text)) return true;
+  if (isNonRepeatableToolName(toolName)) return true;
+  return false;
+}
+
 function safeJson(value: unknown, max = 220): string {
   let text: string;
   try {
@@ -338,7 +376,9 @@ function isCoreToolName(toolName: string): boolean {
 
 function shouldPreserveHistoricalToolCallArgs(block: any): boolean {
   const name = String(block?.name ?? "");
-  if (name === "edit" || name === "write") return true;
+  if (name === "edit" || name === "write" || isMutationToolName(name)) return true;
+  if (name === "bash" && isSideEffectfulShellCommand(block?.arguments)) return true;
+  if (isNonRepeatableToolName(name)) return true;
 
   // Multi-tool calls may wrap edit/write calls. Preserve the whole wrapper so
   // historical mutation arguments (especially exact oldText/newText pairs) stay
@@ -1157,6 +1197,7 @@ function pruneContextMessages(messages: AnyMessage[], pruneMode: CpruneMode = mo
     const toolName = call?.name ?? current.toolName ?? "tool";
     const fullText = textFromContent(current.content);
     if (!fullText) return current;
+    if (shouldPreserveToolResult(toolName, call?.args ?? {}, current, fullText)) return current;
 
     const ids = toolEntityIds(toolName, fullText, call?.args ?? {});
     if (fullMode && !current.isError && ids.length > 0 && fullText.length >= config.minSupersededToolResultChars) {
@@ -2061,6 +2102,7 @@ export default function cprune(pi: ExtensionAPI) {
 
     const fullText = textFromContent(event.content);
     if (!fullText) return;
+    if (shouldPreserveToolResult(event.toolName, event.input, event, fullText)) return;
 
     if (fullText.length >= config.minDuplicateChars) {
       const hash = hashText(fullText);

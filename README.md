@@ -10,7 +10,7 @@ Entity-aware pruning is generic rather than tied to one extension: it detects ID
 
 - Three operating modes: **off**, **safe**, and **full**.
 - `/cprune` shows a compact off/safe/full comparison with red/orange/green bars.
-- Conservative persist-time pruning handles exact/normalized duplicates, append repeats, and oversized tool results.
+- Conservative persist-time pruning handles exact/normalized duplicates, append repeats, and oversized tool results, while preserving failed diagnostics, mutation outputs, side-effectful shell commands, and non-repeatable browser/API-style results.
 - Prompt-time pruning removes stale, duplicate, oversized, or explicitly user-excluded context before model calls.
 - `/cprune review` and `/cprune review-prompts` let users explicitly exclude large entries or prompt/response turns without rewriting Pi history.
 - `/cprune compact` appends a supported Pi compaction entry using a deterministic cprune summary, avoiding model `context_length_exceeded` failures on very large sessions.
@@ -36,7 +36,7 @@ cprune has three operating modes:
 
 Risk levels:
 
-- Low risk / near-lossless: exact duplicates, normalized duplicates, exact append/prefix repeats, and repeated chunks where a newer full copy remains.
+- Low risk / near-lossless: exact duplicates, normalized duplicates, exact append/prefix repeats, and repeated chunks where a newer full copy remains. cprune preserves failed/error diagnostics, mutation outputs, side-effectful shell commands, and non-repeatable browser/API-style results by default.
 - Medium risk: stale file-read pruning, superseded entity/tool-result pruning, structured notice compaction, and historical tool-call argument compaction.
 - Explicitly lossy: old assistant thinking removal, latest-entity-snapshot-wins summaries, and `/cprune compact`.
 
