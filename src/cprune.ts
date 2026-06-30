@@ -253,6 +253,12 @@ let committedPrefixForms: AnyMessage[] = [];
 let cumulativeCostSavedEstimate = 0;
 let lastTurnCostSavedEstimate = 0;
 let lastFootprintTokens: { off: number; safe: number; full: number } = { off: 0, safe: 0, full: 0 };
+// Set on the turn where history shrinks (compaction / branch switch / undo) and
+// cleared on the next live turn. While set, the cache prediction has no valid
+// reference frame (the provider's cache was just invalidated by the history
+// replacement), so the display explains the low real hit instead of showing a
+// misleading self-comparison.
+let compactionRebuildPending = false;
 
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex");
@@ -1899,6 +1905,17 @@ function contextHookPrune(rawMessages: AnyMessage[], pruneMode: CpruneMode): Any
 }
 
 function refreshCachePrediction(raw: AnyMessage[], commit: boolean): void {
+  // Detect history shrink (compaction / branch switch / undo): a normal turn
+  // only ever appends messages, so a smaller message count than the last
+  // committed baseline means the history was replaced. The provider's cache is
+  // invalidated by that replacement, so the prior fingerprints are meaningless —
+  // drop the baseline and flag a rebuild so the display explains the low real
+  // hit instead of showing a trivial self-comparison.
+  let shrunk = false;
+  if (cacheBaseline && raw.length < cacheBaseline.off.fps.length) {
+    cacheBaseline = undefined;
+    shrunk = true;
+  }
   const offFp = fingerprintsFor(raw);
   const snapshot = cloneStats();
   const safePruned = pruneContextMessages(raw, "safe");
@@ -1917,10 +1934,18 @@ function refreshCachePrediction(raw: AnyMessage[], commit: boolean): void {
     safe: Math.ceil(safeFp.sizes.reduce((s, n) => s + n, 0) / 4),
     full: Math.ceil(fullFp.sizes.reduce((s, n) => s + n, 0) / 4),
   };
-  // Only the live context hook advances the baseline; display/load refreshes use
-  // the restored baseline without committing, so a bare `/cprune` after reload
-  // still compares against the previous turn.
-  if (commit) cacheBaseline = { off: offFp, safe: safeFp, full: fullFp };
+  // Only the live context hook advances the baseline. On the compaction turn we
+  // deliberately do NOT commit (the self-comparison would be misleading); the
+  // flag stays set so the display explains the rebuild, and the next live turn
+  // commits a fresh baseline and clears the flag.
+  if (commit) {
+    if (shrunk) {
+      compactionRebuildPending = true;
+    } else {
+      compactionRebuildPending = false;
+      cacheBaseline = { off: offFp, safe: safeFp, full: fullFp };
+    }
+  }
 }
 
 function trackCacheFingerprints(raw: AnyMessage[]): void {
@@ -2020,6 +2045,11 @@ function cacheImpactLines(): string[] {
       ? "prefix-cache (change invalidates the tail)"
       : "unknown cache model (prefix-cache assumed)";
   const lines: string[] = [`Cache: ${modelLabel}`];
+  if (compactionRebuildPending) {
+    lines.push("  context was just compacted — cache is rebuilding from the summary;");
+    lines.push("  the low last-turn hit reflects that compaction, not a cprune problem.");
+    return lines;
+  }
   if (!baselineReady) {
     lines.push("  predicting vs previous turn — run one more turn for cache impact");
     return lines;
@@ -2435,6 +2465,7 @@ export default function cprune(pi: ExtensionAPI) {
     // reset it on start so the freeze re-establishes cleanly from this turn.
     committedPrefixCount = 0;
     committedPrefixForms = [];
+    compactionRebuildPending = false;
     // cacheBaseline is restored by loadStateFromSession, so the cache prediction
     // continues across reloads instead of going blank.
     ctx.ui.setStatus("cprune", `cprune: ${mode}`);

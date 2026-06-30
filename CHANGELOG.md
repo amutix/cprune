@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.17 - 2026-06-30
+
+### Fixed
+- **Cache prediction no longer lies after compaction.** Right after a compaction, `/cprune` showed a confidently-high predicted cache hit (e.g. `98%`) next to a real `last turn: 2%`. Both were individually "correct" but measured different reference frames: the real 2% reflected the compaction turn (where the provider's cache was invalidated), while the 98% was a trivial post-compaction-vs-post-compaction self-comparison. cprune now detects the history shrink, drops the stale baseline, and shows an honest `context was just compacted — cache is rebuilding` note for one turn, then resumes valid predictions.
+
 ## v0.2.16 - 2026-06-30
 
 ### Fixed
