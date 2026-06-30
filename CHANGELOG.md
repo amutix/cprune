@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.1 - 2026-06-30
+
+### Changed
+- `/cprune` breakdown now shows approximate tokens only instead of raw character counts. This keeps the UI focused on the unit users care about and avoids confusion with the header's real request-token usage.
+
 ## v0.4.0 - 2026-06-30
 
 ### Changed

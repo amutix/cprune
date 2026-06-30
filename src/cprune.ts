@@ -1692,6 +1692,10 @@ function colorBar(value: number, max: number, kind: "off" | "safe" | "full" | "b
   return `${color}${filled}${reset}${padding}`;
 }
 
+function approxTokensFromChars(chars: number): number {
+  return Math.ceil(chars / 4);
+}
+
 function triBreakdownLines(off: Breakdown, safe: Breakdown, full: Breakdown): string[] {
   const labels = [
     "tool results",
@@ -1717,10 +1721,13 @@ function triBreakdownLines(off: Breakdown, safe: Breakdown, full: Breakdown): st
     const o = off[label] ?? 0;
     const s = safe[label] ?? 0;
     const f = full[label] ?? 0;
+    const oTok = approxTokensFromChars(o);
+    const sTok = approxTokensFromChars(s);
+    const fTok = approxTokensFromChars(f);
     return [
-      `  ${label.padEnd(20)} ${colorBar(o, max, "off", 12)} ${fmtInt(o).padStart(10)} chars  off`,
-      `  ${"".padEnd(20)} ${colorBar(s, max, "safe", 12)} ${fmtInt(s).padStart(10)} chars  safe saved ${fmtInt(Math.max(0, o - s))}`,
-      `  ${"".padEnd(20)} ${colorBar(f, max, "full", 12)} ${fmtInt(f).padStart(10)} chars  full saved ${fmtInt(Math.max(0, o - f))}`,
+      `  ${label.padEnd(20)} ${colorBar(o, max, "off", 12)} ${fmtInt(oTok).padStart(9)} tok  off`,
+      `  ${"".padEnd(20)} ${colorBar(s, max, "safe", 12)} ${fmtInt(sTok).padStart(9)} tok  safe saved ${fmtInt(Math.max(0, oTok - sTok))}`,
+      `  ${"".padEnd(20)} ${colorBar(f, max, "full", 12)} ${fmtInt(fTok).padStart(9)} tok  full saved ${fmtInt(Math.max(0, oTok - fTok))}`,
     ];
   });
 }
@@ -1960,7 +1967,7 @@ function contextStatText(ctx: any): string {
   out.push(`  est. saved session   : ${fmtMoney(cumulativeCostSavedEstimate)}${costTag}`);
 
   out.push("");
-  out.push("Breakdown by context part (off / safe / full)");
+  out.push("Breakdown by context part, approx tok (off / safe / full)");
   out.push(...triBreakdownLines(off.beforeBreakdown, safe.afterBreakdown, full.afterBreakdown));
 
   out.push("");
