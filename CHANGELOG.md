@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.5 - 2026-06-30
+
+### Fixed
+- Cache-impact predictor now uses a **content-aware model** instead of brittle strict-prefix matching. Previously a single changed message invalidated the whole tail (~9× overestimate of cache misses). Real providers cache by block/content, so unchanged messages after the prefix break are re-served from cache. The predictor now matches measured reality (e.g. predicted 98% hit vs actual 98%).
+- Relabeled the divergence marker from `break@` to `first-change@` and clarified that `read%` includes content reuse.
+
 ## v0.2.4 - 2026-06-30
 
 ### Added

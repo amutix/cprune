@@ -1743,20 +1743,42 @@ function fingerprintsFor(messages: AnyMessage[]): FingerprintSet {
   };
 }
 
-function prefixMatch(prev: FingerprintSet | undefined, curr: FingerprintSet): CachePrediction {
+function cacheModel(prev: FingerprintSet | undefined, curr: FingerprintSet): CachePrediction {
   const totalChars = curr.sizes.reduce((sum, size) => sum + size, 0);
   const totalTokens = Math.ceil(totalChars / 4);
   if (!prev || prev.fps.length === 0) {
     return { readTokens: 0, missTokens: totalTokens, totalTokens, hitPct: 0, breakAt: 0, hasBaseline: false };
   }
   const n = Math.min(prev.fps.length, curr.fps.length);
-  let matchedChars = 0;
+  // 1) Strict prefix: walk until the first divergence. Everything up to here is
+  //    a definite cache read on any provider.
+  let prefixChars = 0;
   let breakAt = n;
   for (let i = 0; i < n; i++) {
     if (prev.fps[i] !== curr.fps[i]) { breakAt = i; break; }
-    matchedChars += curr.sizes[i];
+    prefixChars += curr.sizes[i];
   }
-  const readTokens = Math.ceil(matchedChars / 4);
+  // 2) Content reuse after the break: providers that cache by content/block
+  //    (OpenAI, glm gateways, etc.) re-serve unchanged messages even after the
+  //    strict prefix breaks. Only genuinely changed or brand-new content misses.
+  //    Build a multiset of prev fingerprints, subtract the prefix-consumed ones,
+  //    then match the tail by content.
+  const available = new Map<string, number>();
+  for (const fp of prev.fps) available.set(fp, (available.get(fp) ?? 0) + 1);
+  for (let i = 0; i < breakAt; i++) {
+    const fp = prev.fps[i];
+    available.set(fp, (available.get(fp) ?? 0) - 1);
+  }
+  let reuseChars = 0;
+  for (let i = breakAt; i < curr.fps.length; i++) {
+    const fp = curr.fps[i];
+    const left = available.get(fp) ?? 0;
+    if (left > 0) {
+      available.set(fp, left - 1);
+      reuseChars += curr.sizes[i];
+    }
+  }
+  const readTokens = Math.ceil((prefixChars + reuseChars) / 4);
   const missTokens = Math.max(0, totalTokens - readTokens);
   const hitPct = totalTokens > 0 ? (readTokens / totalTokens) * 100 : 0;
   return { readTokens, missTokens, totalTokens, hitPct, breakAt, hasBaseline: true };
@@ -1772,9 +1794,9 @@ function trackCacheFingerprints(raw: AnyMessage[]): void {
   const fullFp = fingerprintsFor(fullPruned);
 
   cachePrediction = {
-    off: prefixMatch(cacheBaseline?.off, offFp),
-    safe: prefixMatch(cacheBaseline?.safe, safeFp),
-    full: prefixMatch(cacheBaseline?.full, fullFp),
+    off: cacheModel(cacheBaseline?.off, offFp),
+    safe: cacheModel(cacheBaseline?.safe, safeFp),
+    full: cacheModel(cacheBaseline?.full, fullFp),
   };
   cacheBaseline = { off: offFp, safe: safeFp, full: fullFp };
 }
@@ -1813,7 +1835,7 @@ function cacheImpactLines(): string[] {
   const safe = cachePrediction.safe;
   const full = cachePrediction.full;
   const baselineReady = off.hasBaseline || safe.hasBaseline || full.hasBaseline;
-  const lines: string[] = ["", "Cache impact (predicted vs previous turn, no extra LLM calls)"];
+  const lines: string[] = ["", "Cache impact (predicted vs previous turn, content-aware, no extra LLM calls)"];
   if (!baselineReady) {
     lines.push("  collecting baseline — run one more turn to compare cache hits");
     return lines;
@@ -1821,11 +1843,12 @@ function cacheImpactLines(): string[] {
   const offCost = relativeCacheCost(off);
   const row = (label: string, p: CachePrediction) => {
     const extraMiss = Math.max(0, p.missTokens - (off.hasBaseline ? off.missTokens : 0));
-    const breakNote = p.hasBaseline && p.breakAt < p.totalTokens ? ` break@${fmtInt(p.breakAt)}` : "";
+    const breakNote = p.hasBaseline && p.breakAt < p.totalTokens ? ` first-change@${fmtInt(p.breakAt)}` : "";
     const costIdx = offCost > 0 ? relativeCacheCost(p) / offCost : 1;
     return `  ${label.padEnd(5)} read ${p.hitPct.toFixed(0).padStart(3)}%  miss ~${fmtInt(p.missTokens)} tok  vs-off +${fmtInt(extraMiss)}${breakNote}  cost×${costIdx.toFixed(2)}`;
   };
   lines.push(row("off", off), row("safe", safe), row("full", full));
+  lines.push("  (read% includes content reuse after the prefix break; providers cache by block/content, not strict prefix)");
 
   const actual = lastActualUsage;
   if (actual && actual.totalTokens > 0) {
