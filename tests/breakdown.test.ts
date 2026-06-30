@@ -6,7 +6,7 @@ function sum(values: Record<string, number>): number {
   return Object.values(values).reduce((total, value) => total + value, 0);
 }
 
-test("breakdown token allocation sums to the displayed total despite rounding", () => {
+test("breakdown token allocation sums to the headline total despite rounding", () => {
   const breakdown = {
     "tool results": 1,
     "assistant thinking": 1,
@@ -20,7 +20,7 @@ test("breakdown token allocation sums to the displayed total despite rounding", 
   assert.equal(sum(allocated), totalTokens);
 });
 
-test("context totals equal the sum of displayed breakdown token buckets", () => {
+test("headline context totals equal the sum of displayed breakdown token buckets", () => {
   const messages = [
     { role: "toolResult", content: [{ type: "text", text: "x".repeat(101) }] },
     {

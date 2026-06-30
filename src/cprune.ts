@@ -1772,11 +1772,6 @@ function triBreakdownLines(
     ];
   });
 
-  lines.push(
-    `  ${"total".padEnd(20)} ${colorBar(totals.off, Math.max(1, totals.off), "off", 12)} ${fmtInt(offTok).padStart(9)} tok  off`,
-    `  ${"".padEnd(20)} ${colorBar(totals.safe, Math.max(1, totals.off), "safe", 12)} ${fmtInt(safeTok).padStart(9)} tok  safe saved ${fmtInt(Math.max(0, offTok - safeTok))}`,
-    `  ${"".padEnd(20)} ${colorBar(totals.full, Math.max(1, totals.off), "full", 12)} ${fmtInt(fullTok).padStart(9)} tok  full saved ${fmtInt(Math.max(0, offTok - fullTok))}`,
-  );
   return lines;
 }
 

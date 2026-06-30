@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.4 - 2026-06-30
+
+### Changed
+- Removed the repeated `total` row from the breakdown. The headline already shows off/safe/full totals; the breakdown now only shows the contributing context parts.
+- Kept the tested token allocation so displayed breakdown buckets still sum to the headline totals.
+
 ## v0.4.3 - 2026-06-30
 
 ### Fixed
