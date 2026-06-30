@@ -1,110 +1,202 @@
-# cprune Pi extension
+# cprune
 
-Context pruning extension for Pi. It reduces duplicate, append-only, stale, and oversized context before model calls. It can also request Pi's supported persistent compaction mechanism when you explicitly want a lossy summary.
+**cprune is a Pi extension that trims noisy agent context before model calls.**
 
-Append/contained pruning detects exact byte prefixes, normalized line-prefixes, substantial normalized contained blocks, and repeated line chunks, so it can catch repeated output with new lines appended even when ANSI escapes, CRLF/LF, trailing whitespace, small wrappers, or some middle insertions differ. Older repeated read-only snapshot commands such as `rg`, `find`, `ls`, and `git status` are also pruned when the same command is run again later. Old custom extension messages are deduped/truncated generically, structured entity notifications are compacted when superseded, and boilerplate “run/show for full context” tails are stripped without hardcoding one extension.
+It reduces repeated tool output, append-only logs, stale read-only snapshots, oversized results, old assistant thinking, and selected historical prompt turns so long Pi sessions stay cheaper and easier for the model to use.
 
-Entity-aware pruning is generic rather than tied to one extension: it detects IDs like `TASK-123`, `SPEC-12`, `DISC-3`, `ISSUE-9`, `PR-42`, etc., then applies a latest-entity-snapshot-wins policy across older user messages, custom extension messages, tool results, assistant text, and summaries while preserving IDs, hashes, and short previews. Old successful assistant tool calls can be compacted to tool name, IDs/paths, hash, and preview, so large prior spec/comment bodies do not remain in request context. Non-core tool results with the same tool+entity are also superseded by newer successful results.
+It is designed for agentic coding sessions where the same information often appears many times: repeated `rg`/`find`/`ls` output, growing command logs, duplicated task/spec notifications, long tool results, and old reasoning blocks.
 
-## Highlights
+## What you get
 
-- Three operating modes: **off**, **safe**, and **full**.
-- `/cprune` shows a compact off/safe/full comparison with red/orange/green bars, plus a cache-impact section that predicts per-mode prompt-cache hit rate vs the previous turn **without extra LLM calls**.
-- Conservative persist-time pruning handles exact/normalized duplicates, append repeats, and oversized tool results, while preserving failed diagnostics, mutation outputs, side-effectful shell commands, and non-repeatable browser/API-style results.
-- Prompt-time pruning removes stale, duplicate, oversized, or explicitly user-excluded context before model calls.
-- `/cprune review` and `/cprune review-prompts` let users explicitly exclude large entries or prompt/response turns without rewriting Pi history.
-- `/cprune compact` appends a supported Pi compaction entry using a deterministic cprune summary, avoiding model `context_length_exceeded` failures on very large sessions.
+- **Lower prompt size** without manually compacting every session.
+- **A clear `/cprune` report** comparing `off`, `safe`, and `full` modes.
+- **Real cache stats** from the provider response (`cacheRead`), not guessed cache predictions.
+- **Cost estimates** for this turn and the whole session.
+- **User review commands** for explicitly excluding noisy old context.
+- **Deterministic lossy compaction** when a session is too large for normal model summarization.
 
-## Screenshot
+## Example output
 
-![cprune off/safe/full context comparison](screenshot.png)
+```text
+cprune
 
-## Cache impact
+   mode: full  ·  gpt-5.5 via openai-codex  ·  51284/272000 tok (18.9%)
+   last turn: 98.2% cache hit  ·  922 tok new  ·  $0.0353
 
-Prompt caching makes long context cheap when consecutive turns share a stable prefix. Pruning that changes an older message retroactively breaks that prefix, turning cheap cached reads into expensive misses. cprune's `/cprune` comparison now shows this tradeoff explicitly:
+   off   ████████████████████████ 39,393 tok
+   safe  ███████████████████████▏ 37,893 tok   −1,500  <$0.01
+   full  █████████████████▋       28,897 tok   −10,496  $0.0525
 
-- **Predicted cache hit** per mode (off/safe/full) computed offline with a **provider-aware** model. Because providers cache differently, cprune detects the cache model from the response (`api`/`provider`) and headlines the matching one: strict-prefix for OpenAI/gpt/Anthropic (a retroactive change invalidates the cached tail), content/block-reuse for zai/glm gateways. No extra model calls are made.
-- **Estimated cost savings** derived from real per-token billing (`usage.cost.input / input`, with a blended fallback). When a provider reports no cost, cprune falls back to assumed model pricing (configurable via `modelInputPricePerMTok` / `fallbackInputPricePerMTok`) and labels it `(assumed pricing)`. Under the cache-aware prefix-freeze, pruned tokens are uncached new-tail tokens, so pricing them at the input rate is a fair estimate of money saved.
-- Cumulative session cost savings persisted across turns.
-- A recommendation appears when `full` mode costs ≥1.3× of `off` on a prefix-sensitive provider.
-- **Relative cost index** using provider economics (cached reads ≈ 0.1×, misses/cache-writes ≈ 1.25×), so you can see when `full` mode's token savings are outweighed by cache penalties.
-- **Actual cache stats** read from the live response (`cacheRead`, `cacheWrite`, `input`, `cost`) to validate the prediction.
+   est. saved this turn : $0.0525
+   est. saved session   : $5.48
 
-This makes the cost/benefit of each mode visible in real sessions rather than only theoretical.
+   ...breakdown by context part...
 
-## Cache preservation
-
-A known risk with any context pruner: retroactively changing an already-sent message can invalidate the prompt cache. cprune is designed to avoid that penalty rather than cause it.
-
-- On **prefix-sensitive providers** (OpenAI/gpt, Anthropic), full mode **freezes the committed prefix** — once a message's pruned form is sent, that form is locked, so the cache prefix never breaks and only the new tail misses.
-- On **content-cache providers** (e.g. zai/glm gateways), which re-serve unchanged blocks after a change, full mode stays fully aggressive since retroactive changes carry no cache penalty there.
-
-`/cprune` reports both a provider-aware *predicted* cache hit (computed offline, no extra LLM calls) and the *actual* `cacheRead` from the live response, along with estimated cost savings, so the tradeoff is visible in real sessions rather than only theoretical.
-
-## Safety and information loss
-
-cprune has two pruning points:
-
-- **Persist-time pruning** runs on new tool results before Pi stores them. This is intentionally conservative and limited to mechanical cases: exact duplicates, normalized duplicates where only ANSI/CRLF/trailing whitespace differ, append/prefix repeats, and oversized tool results with hash/original-size metadata plus retained head/tail preview.
-- **Prompt-time pruning** runs before a model request. It is non-destructive to Pi's active session files, but can be more aggressive because it only changes the context sent to the model for that request. `/cprune review` adds explicit user-approved prompt-time exclusions for large older entries; `/cprune review-prompts [safe|full] [N] [page]` lets you exclude a selected prompt/response turn from prompt history. These exclusions are persisted as cprune state, not by rewriting Pi history.
-
-cprune should not be described as fully lossless. Persist-time pruning is near-lossless but still replaces bytes in saved tool results for the safe cases above. Prompt-time pruning may replace older details with hashes, IDs, previews, and re-run hints. This reduces token use, but the model may no longer see every historical byte in the immediate request.
-
-cprune has three operating modes:
-
-- **off**: no pruning is applied to future tool results or model prompts.
-- **safe**: conservative mode. Persist-time pruning still handles mechanical duplicate/append/oversized tool results, and prompt-time pruning applies low-risk mechanical rules plus user-approved exclusions. It avoids semantic/latest-wins rules such as stale reads, entity snapshot pruning, old thinking removal, and historical tool-call argument compaction.
-- **full**: aggressive/default legacy behavior. Includes safe rules plus semantic/latest-wins prompt-time pruning, stale reads, entity/tool-result supersession, old thinking removal, and tool-call argument compaction.
-
-### Cache-aware full mode
-
-Prompt caching makes long context cheap when consecutive turns share a byte-identical prefix. full-mode supersession can retroactively rewrite an already-sent message, which on **prefix-sensitive providers** (OpenAI/gpt, Anthropic) invalidates the cached tail and re-bills it every turn — measured at a 7–8% cache hit (~$0.5/turn) on gpt-5.5. To avoid this, full mode **freezes the committed prefix**: once a message's pruned form is sent, that form is locked so the prefix stays identical across turns. Only the new (uncommitted) tail is pruned each turn.
-
-This preserves within-turn savings (dedup/truncation of tool results arriving in the same turn, before their first send) while keeping the cache stable. Cross-turn retrospective supersession is disabled for already-sent messages. **Content-cache providers** (e.g. zai/glm gateways, which re-serve unchanged content after a break) are unaffected and keep fully aggressive full mode, since they pay no cache penalty for retroactive changes. Use `/cprune` to see the per-mode cache impact and the detected cache model for the active provider.
-
-Risk levels:
-
-- Low risk / near-lossless: exact duplicates, normalized duplicates, exact append/prefix repeats, and repeated chunks where a newer full copy remains. cprune preserves failed/error diagnostics, mutation outputs, side-effectful shell commands, and non-repeatable browser/API-style results by default.
-- Medium risk: stale file-read pruning, superseded entity/tool-result pruning, structured notice compaction, and historical tool-call argument compaction.
-- Explicitly lossy: old assistant thinking removal, latest-entity-snapshot-wins summaries, and `/cprune compact`.
-
-Recommended wording: cprune uses **conservative near-lossless persist-time pruning** plus **non-destructive but lossy-at-prompt-time pruning**. It preserves recent context, errors, entity IDs, hashes, previews, and re-run hints, but it may remove historical details from saved tool results in safe mechanical cases and from the model request in broader prompt-time cases.
-
-## Install / use
-
-From this directory:
-
-```bash
-pi -e ./src/cprune.ts
+   Cache model: prefix-cache (change invalidates the tail — full mode freezes its prefix)
 ```
 
-Or install from GitHub:
+Interpretation:
+
+- `off` is the raw prompt size with no cprune prompt-time pruning.
+- `safe` is conservative pruning.
+- `full` is aggressive pruning.
+- `last turn` is the **actual provider-reported cache behavior** from the previous model call.
+- `est. saved` is calculated from the exact prompt-token delta captured before the model call, priced with real billing data when available or clearly labeled assumed pricing otherwise.
+
+## Install
 
 ```bash
 pi install git:github.com/amutix/cprune
 ```
 
-Or install/configure it as a Pi package; `package.json` exposes `src/cprune.ts` under the `pi.extensions` field.
+Or run from a checkout:
+
+```bash
+pi -e ./src/cprune.ts
+```
 
 ## Commands
 
 ```text
-/cprune                    Compare off/safe/full context sizes
-/cprune review             Pick large older context entries to exclude from future prompts
-/cprune review-prompts [safe|full] [N] [page] Pick a prompt/response turn from history
-/cprune clear-exclusions   Clear user-approved prompt-time exclusions
+/cprune                    Show off/safe/full comparison
 /cprune safe               Enable conservative pruning
-/cprune full               Enable full/aggressive pruning (`on` is an alias)
+/cprune full               Enable aggressive pruning (`on` is an alias)
 /cprune off                Disable pruning
-/cprune compact            Lossily compact/prune context via Pi compaction
+/cprune review             Pick large older entries to exclude from future prompts
+/cprune review-prompts     Pick an old prompt/response turn to exclude
+/cprune clear-exclusions   Clear user-approved exclusions
+/cprune compact            Add a lossy deterministic compaction summary
 ```
 
-## Tool
+cprune also registers an LLM-callable tool named `cprune_status` with actions `safe`, `full`, `off`, and `compact`.
 
-cprune also registers an LLM-callable tool named `cprune_status`. Omitting `action` returns the same off/safe/full comparison as `/cprune`; actions `safe`, `full`, `off`, and `compact` change mode or request lossy compaction.
+## Modes
 
-`/cprune` shows a compact cost-aware view:
+### `off`
 
-`/cprune review-prompts [safe|full] [N] [page]` is useful after accidentally pushing a noisy prompt/response/tool-output turn into context. Safe mode is the default and mirrors Pi prompt behavior: it skips hidden shell entries such as `!!cmd` because Pi marks them `excludeFromContext`, while keeping normal `!cmd` entries as selectable shell-command items. Full mode shows raw branch history, including hidden `!!cmd` entries, for users who want complete visibility. The selected turn is excluded from future prompts when it appears in model context; Pi session entries are not deleted. Results are paginated; jump directly with e.g. `/cprune review-prompts safe 50 2` or `/cprune review-prompts full 50`.
+No future pruning is applied. `/cprune` still simulates `safe` and `full` so you can see what would be saved.
 
-Note: `/cprune compact` is intentionally named compact because it is lossy summarization. It does not rewrite Pi session JSONL files in place; it uses Pi's `session_before_compact` hook to provide a deterministic cprune summary and append a normal compaction entry, which is safer for Pi's append-only session/tree model and avoids model context-window failures during summarization. Turning pruning off prevents future pruning; it does not reconstruct tool outputs that were already pruned before persistence.
+### `safe`
+
+Conservative mode. Focuses on mechanical duplication and size reduction:
+
+- exact duplicate tool results
+- normalized duplicates where only ANSI/CRLF/trailing whitespace differ
+- append-only repeats where a previous output is contained in a newer one
+- repeated line chunks
+- oversized tool-result truncation with hash/original-size metadata
+- explicit user-approved exclusions from `/cprune review*`
+
+Safe mode avoids semantic/latest-wins rules such as stale reads, entity supersession, old thinking removal, and historical tool-call argument compaction.
+
+### `full`
+
+Aggressive mode. Includes safe-mode rules plus higher-savings prompt-time pruning:
+
+- stale read-only snapshot pruning (`rg`, `find`, `ls`, `git status`, etc.)
+- superseded custom/entity/tool-result snapshots
+- old assistant thinking removal
+- historical tool-call argument compaction for safe tool calls
+- structured notice compaction
+
+User messages are **not** semantically compacted automatically. You can still explicitly exclude selected old user/prompt turns with review commands.
+
+## How it works
+
+cprune has two pruning points:
+
+### 1. Persist-time pruning
+
+Runs when new tool results arrive, before Pi stores them. This is deliberately conservative. It only rewrites saved tool results for near-mechanical cases such as duplicates, append repeats, and oversized outputs.
+
+It preserves:
+
+- failed/error diagnostics
+- mutation outputs
+- side-effectful shell commands
+- browser/API/auth/payment/deploy-style results
+- edit/write/apply-patch arguments and outputs
+- sensitive nested `multi_tool_use.parallel` calls
+
+### 2. Prompt-time pruning
+
+Runs right before a model request. It does **not** rewrite Pi history; it only changes the message array sent to the model for that call.
+
+Prompt-time pruning can be more aggressive in `full` mode because the original session entries remain in Pi history. Replacements include hashes, IDs, previews, original sizes, and re-run hints where useful.
+
+## Cache behavior
+
+Prompt caching can make long sessions cheap when consecutive requests share a stable prefix. A context pruner can accidentally ruin that by changing old messages every turn.
+
+cprune handles this carefully:
+
+- On **prefix-cache providers** such as OpenAI/gpt and Anthropic-style APIs, `full` mode freezes the already-sent prefix. Only the new tail is aggressively pruned. This preserves prompt-cache stability.
+- On **content-cache providers** such as zai/glm gateways, `full` mode stays fully aggressive because those providers can reuse unchanged blocks even after a prefix change.
+
+`/cprune` does **not** predict cache hit rates. Prediction turned out to be less reliable than the APIs themselves. Instead, cprune reports the real last-turn cache hit from provider usage data.
+
+## Safety model
+
+cprune is not magic lossless compression.
+
+- **Near-lossless:** exact duplicates, normalized duplicates, append repeats, repeated chunks where a newer full copy remains.
+- **Conservative lossy:** oversized persisted tool results keep head/tail, original size, and hash.
+- **Prompt-only lossy:** full-mode stale/superseded historical context may be replaced with compact summaries, IDs, hashes, and previews.
+- **Explicitly lossy:** `/cprune compact` creates a persistent summary entry.
+
+Turning cprune off stops future pruning. It does not reconstruct tool results that were already pruned before persistence.
+
+## Manual review commands
+
+```text
+/cprune review
+```
+
+Shows large older context entries and lets you exclude selected ones from future prompts. Pi history is not deleted.
+
+```text
+/cprune review-prompts [safe|full] [N] [page]
+```
+
+Shows historical prompt/response turns and lets you exclude selected noisy turns. Useful after accidentally dumping huge output into the conversation.
+
+Examples:
+
+```text
+/cprune review-prompts safe 50 2
+/cprune review-prompts full 50
+```
+
+## Compaction
+
+```text
+/cprune compact
+```
+
+Adds a deterministic cprune summary through Pi's supported compaction hook. It is intentionally called **compact** because it is lossy.
+
+This is useful when a session is so large that normal model-based summarization would itself exceed the context window. cprune does not rewrite Pi JSONL files in place; it appends a normal compaction entry.
+
+## What cprune does not do
+
+- It does not change model weights or retrieval behavior.
+- It does not promise fully lossless compression.
+- It does not delete Pi session history for prompt-time pruning.
+- It does not predict cache hits for modes you did not run.
+- It does not preserve every old byte in the immediate model request when `full` mode or compaction is used.
+
+## When should I use it?
+
+Use cprune if you run long Pi coding sessions with lots of repeated tool output or extension state.
+
+Recommended default:
+
+- Start with **`full`** if you want maximum savings and trust cprune's safety guards.
+- Use **`safe`** for conservative production/debugging sessions.
+- Use **`off`** when investigating whether pruning affects a specific behavior.
+
+Run `/cprune` any time to see what it is doing.
+
+## License
+
+MIT

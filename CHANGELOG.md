@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3.1 - 2026-06-30
+
+### Stabilization / hardening
+- Anchored `est. saved this turn` to the exact prompt sent in the `context` hook instead of reconstructing savings after the assistant response. This keeps turn-level savings aligned with the real model request while still pricing with the provider's actual usage/cost data from `agent_end`.
+- Added raw-message identity hashes to the prefix-freeze guard. cprune no longer trusts message indexes alone, so branch switches/undo/history rewrites of the same length cannot accidentally reuse frozen pruned forms from a different branch.
+- Stopped automatic semantic/entity pruning of user messages in full mode. User messages can still be excluded explicitly via review commands, but full mode no longer rewrites them via latest-entity-wins heuristics.
+- Hardened preservation of side-effectful/non-repeatable nested `multi_tool_use.parallel` calls. Wrappers containing edit/write, mutation tools, browser/API-style tools, or side-effectful bash commands now keep their historical arguments/results intact.
+- Expanded side-effectful shell detection for `sed/perl -i`, `curl -X POST|PUT|PATCH|DELETE`, `gh release/repo/api/pr/issue` mutations, `git tag`, `dd`, `truncate`, `rsync`, and `install`.
+- Removed dead display helpers left behind by the cache-prediction removal.
+- Updated README to describe measurement-only cache reporting and the current user-message safety policy.
+
 ## v0.3.0 - 2026-06-30
 
 ### Changed — prediction removed, measurement only

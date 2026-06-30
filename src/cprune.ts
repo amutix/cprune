@@ -228,6 +228,7 @@ let lastActualUsage: ActualUsage | undefined;
 // providers (OpenAI/gpt, Anthropic). Only the new (uncommitted) tail is pruned.
 let committedPrefixCount = 0;
 let committedPrefixForms: AnyMessage[] = [];
+let committedPrefixRawHashes: string[] = [];
 
 // Cost-savings estimate (cumulative across the session, persisted). At each turn we
 // estimate how much cprune saved vs running in `off` mode, derived deterministically
@@ -237,9 +238,32 @@ let committedPrefixForms: AnyMessage[] = [];
 // rate derived from the last response's billing.
 let cumulativeCostSavedEstimate = 0;
 let lastTurnCostSavedEstimate = 0;
+let lastPromptSavedTokens = 0;
 
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex");
+}
+
+function messageIdentityHash(message: AnyMessage): string {
+  // Hash only request-relevant prompt fields, not volatile response metadata such
+  // as usage/cost/model/provider/timestamps. This guard is for branch/undo safety:
+  // it should detect a different prompt message at the same index, but not break
+  // the freeze merely because Pi later annotated an assistant message with usage.
+  const stable = {
+    role: message?.role,
+    content: message?.content,
+    summary: message?.summary,
+    customType: message?.customType,
+    name: message?.name,
+    toolName: message?.toolName,
+    toolCallId: message?.toolCallId,
+    id: message?.id,
+  };
+  try {
+    return hashText(JSON.stringify(stable) ?? "");
+  } catch {
+    return hashText(safeJson(stable, 200_000));
+  }
 }
 
 function shortHash(hash: string): string {
@@ -314,9 +338,12 @@ function commandText(input: unknown): string {
 function isSideEffectfulShellCommand(command: unknown): boolean {
   const normalized = commandText(command).trim().replace(/\s+/g, " ");
   if (!normalized) return false;
-  if (/[;&|]\s*(rm|mv|cp|chmod|chown|mkdir|touch|tee)\b/.test(normalized)) return true;
+  if (/[;&|]\s*(rm|mv|cp|chmod|chown|mkdir|touch|tee|dd|truncate|rsync|install)\b/.test(normalized)) return true;
   if (/(^|\s)(>|>>|2>|2>>|&>)\s*\S+/.test(normalized)) return true;
-  return /^(rm|mv|cp|chmod|chown|mkdir|touch|tee|git (add|commit|push|pull|merge|rebase|reset|checkout|switch|clean|apply)|npm (install|i|ci|version|publish|pack)|pnpm (install|add|remove|update|publish)|yarn (install|add|remove|publish)|bun (install|add|remove)|pip install|cargo (fix|publish|install)|docker (run|rm|stop|kill|compose up|compose down)|kubectl (apply|delete|patch|scale|rollout|create)|terraform (apply|destroy|import)|prisma migrate|alembic upgrade|psql .*\b(insert|update|delete|create|drop|alter)\b)/i.test(normalized);
+  if (/\b(sed|perl)\s+[^\n]*\s-i\b/i.test(normalized)) return true;
+  if (/\bcurl\b[^\n]*\s-X\s*(POST|PUT|PATCH|DELETE)\b/i.test(normalized)) return true;
+  if (/\bgh\s+(release|repo|api|pr|issue)\s+(create|edit|delete|close|merge|upload|view --web)\b/i.test(normalized)) return true;
+  return /^(rm|mv|cp|chmod|chown|mkdir|touch|tee|dd|truncate|rsync|install|git (add|commit|push|pull|merge|rebase|reset|checkout|switch|clean|apply|tag)|npm (install|i|ci|version|publish|pack)|pnpm (install|add|remove|update|publish)|yarn (install|add|remove|publish)|bun (install|add|remove)|pip install|cargo (fix|publish|install)|docker (run|rm|stop|kill|compose up|compose down)|kubectl (apply|delete|patch|scale|rollout|create)|terraform (apply|destroy|import)|prisma migrate|alembic upgrade|psql .*\b(insert|update|delete|create|drop|alter)\b)/i.test(normalized);
 }
 
 function looksFailureDiagnostic(text: string): boolean {
@@ -335,6 +362,7 @@ function isNonRepeatableToolName(toolName: string): boolean {
 function shouldPreserveToolResult(toolName: string, input: unknown, result: AnyMessage | { isError?: unknown }, text: string): boolean {
   if (result?.isError) return true;
   if (isMutationToolName(toolName)) return true;
+  if (toolName === "multi_tool_use.parallel" && hasSensitiveNestedToolUse(input)) return true;
   if (toolName === "bash" && isSideEffectfulShellCommand(input)) return true;
   if (looksFailureDiagnostic(text)) return true;
   if (isNonRepeatableToolName(toolName)) return true;
@@ -447,6 +475,25 @@ function isCoreToolName(toolName: string): boolean {
   return ["read", "bash", "edit", "write", "multi_tool_use.parallel"].includes(toolName);
 }
 
+function isSensitiveNestedToolUse(toolUse: any): boolean {
+  const recipient = String(toolUse?.recipient_name ?? "");
+  const nestedName = recipient.split(".").filter(Boolean).at(-1) ?? recipient;
+  const params = toolUse?.parameters ?? toolUse?.arguments ?? {};
+  return nestedName === "edit"
+    || nestedName === "write"
+    || isMutationToolName(recipient)
+    || isMutationToolName(nestedName)
+    || isNonRepeatableToolName(recipient)
+    || isNonRepeatableToolName(nestedName)
+    || (nestedName === "bash" && isSideEffectfulShellCommand(params));
+}
+
+function hasSensitiveNestedToolUse(input: unknown): boolean {
+  if (!input || typeof input !== "object") return false;
+  const toolUses = (input as Record<string, unknown>).tool_uses;
+  return Array.isArray(toolUses) && toolUses.some(isSensitiveNestedToolUse);
+}
+
 function shouldPreserveHistoricalToolCallArgs(block: any): boolean {
   const name = String(block?.name ?? "");
   if (name === "edit" || name === "write" || isMutationToolName(name)) return true;
@@ -458,12 +505,7 @@ function shouldPreserveHistoricalToolCallArgs(block: any): boolean {
   // available to the model for follow-up fixes and do not become cprune markers
   // inside diffs or future edits.
   if (name === "multi_tool_use.parallel") {
-    const toolUses = block?.arguments?.tool_uses;
-    return Array.isArray(toolUses)
-      && toolUses.some((toolUse: any) => {
-        const recipient = String(toolUse?.recipient_name ?? "");
-        return recipient === "functions.edit" || recipient === "functions.write" || recipient.endsWith(".edit") || recipient.endsWith(".write");
-      });
+    return hasSensitiveNestedToolUse(block?.arguments);
   }
 
   return false;
@@ -1184,20 +1226,6 @@ function pruneContextMessages(messages: AnyMessage[], pruneMode: CpruneMode = mo
       return current;
     }
 
-    if (fullMode && current?.role === "user") {
-      const fullText = textFromContent(current.content);
-      if (!fullText) return current;
-      const entityPruned = pruneEntityText(fullText, "user message", index, latestEntityIndex, seenEntities);
-      if (entityPruned.pruned) {
-        stats.contextEntityPruned++;
-        touched++;
-        recordSavings(entityPruned.saved, "savedEntityChars");
-        recordEntityFamilySavings(extractEntityIds(fullText), entityPruned.saved);
-        return cloneWithText(current, entityPruned.text);
-      }
-      return current;
-    }
-
     if (current?.role === "custom") {
       const label = `custom:${current.customType ?? "message"}`;
       const fullText = textFromContent(current.content);
@@ -1628,10 +1656,6 @@ function fmtInt(value: number): string {
   return value.toLocaleString();
 }
 
-function fmtPct(value: number): string {
-  return `${value.toFixed(1)}%`;
-}
-
 const PARTIAL_BLOCKS = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
 const BRIGHT_TEXT = "\x1b[22m\x1b[39m";
 
@@ -1656,11 +1680,6 @@ function blockBar(value: number, max: number, width: number): { filled: string; 
   };
 }
 
-function bar(value: number, max: number, width = 32): string {
-  const { filled, padding } = blockBar(value, max, width);
-  return `${filled}${padding}`;
-}
-
 function colorBar(value: number, max: number, kind: "off" | "safe" | "full" | "before" | "after", width = 24): string {
   const { filled, padding } = blockBar(value, max, width);
   if (!filled) return padding;
@@ -1671,37 +1690,6 @@ function colorBar(value: number, max: number, kind: "off" | "safe" | "full" | "b
   const color = kind === "off" || kind === "before" ? "\x1b[31m" : kind === "safe" ? "\x1b[38;5;208m" : "\x1b[32m";
   const reset = "\x1b[0m";
   return `${color}${filled}${reset}${padding}`;
-}
-
-function breakdownLines(before: Breakdown, after: Breakdown): string[] {
-  const labels = [
-    "tool results",
-    "assistant thinking",
-    "assistant text",
-    "tool calls",
-    "custom messages",
-    "user messages",
-    "summaries",
-    "bash executions",
-    "assistant other",
-    "other",
-  ];
-  const present = labels.filter((label) => (before[label] ?? 0) > 0 || (after[label] ?? 0) > 0);
-  const dynamic = [...new Set([...Object.keys(before), ...Object.keys(after)])]
-    .filter((label) => !labels.includes(label))
-    .sort();
-  const ordered = [...present, ...dynamic];
-  const max = Math.max(1, ...ordered.map((label) => Math.max(before[label] ?? 0, after[label] ?? 0)));
-
-  return ordered.flatMap((label) => {
-    const b = before[label] ?? 0;
-    const a = after[label] ?? 0;
-    const saved = Math.max(0, b - a);
-    return [
-      `  ${label.padEnd(20)} ${colorBar(b, max, "off", 12)} ${fmtInt(b).padStart(10)} chars`,
-      `  ${"".padEnd(20)} ${colorBar(a, max, "full", 12)} ${fmtInt(a).padStart(10)} chars  saved ${fmtInt(saved)}`,
-    ];
-  });
 }
 
 function triBreakdownLines(off: Breakdown, safe: Breakdown, full: Breakdown): string[] {
@@ -1794,8 +1782,17 @@ function frozenResultFor(rawMessages: AnyMessage[], aggressive: AnyMessage[]): A
   if (activeCacheModel === "content") return aggressive;
   if (committedPrefixCount === 0) return aggressive;
   if (committedPrefixCount > rawMessages.length) return aggressive;
+
+  // Safety guard: never trust indexes alone. Branch switching / undo can replace
+  // history with a different branch of the same length. Only freeze the verified
+  // unchanged raw prefix; at the first mismatch, stop freezing and use the freshly
+  // pruned form for the rest of the prompt.
   const result = aggressive.slice();
-  for (let i = 0; i < committedPrefixCount && i < result.length; i++) result[i] = committedPrefixForms[i];
+  const limit = Math.min(committedPrefixCount, result.length, committedPrefixForms.length, committedPrefixRawHashes.length);
+  for (let i = 0; i < limit; i++) {
+    if (messageIdentityHash(rawMessages[i]) !== committedPrefixRawHashes[i]) break;
+    result[i] = committedPrefixForms[i];
+  }
   return result;
 }
 
@@ -1808,10 +1805,12 @@ function contextHookPrune(rawMessages: AnyMessage[], pruneMode: CpruneMode): Any
   if (committedPrefixCount > rawMessages.length) {
     committedPrefixCount = 0;
     committedPrefixForms = [];
+    committedPrefixRawHashes = [];
   }
   const result = frozenResultFor(rawMessages, aggressive);
   committedPrefixCount = result.length;
   committedPrefixForms = result.slice();
+  committedPrefixRawHashes = rawMessages.map(messageIdentityHash);
   return result;
 }
 
@@ -1840,7 +1839,7 @@ function recordActualUsage(messages: AnyMessage[]): void {
       provider,
     };
     activeCacheModel = detectCacheModel(api, provider);
-    estimateTurnCostSavings(messages);
+    estimateTurnCostSavings();
     return;
   }
 }
@@ -1874,22 +1873,10 @@ function fmtMoney(value: number): string {
   return `$${value.toFixed(2)}`;
 }
 
-function estimateTurnCostSavings(messages: AnyMessage[]): void {
+function estimateTurnCostSavings(): void {
   const actual = lastActualUsage;
-  if (!actual || !messages.length) { lastTurnCostSavedEstimate = 0; return; }
-  // Deterministic off-vs-active token delta — the SAME math the /cprune display
-  // uses for its bars. No prediction: we don't model how the provider caches the
-  // pruned tokens, we just price the saved (uncached new-tail) tokens at the real
-  // input rate. Under the cache-aware freeze these are exactly the tokens that
-  // would otherwise be billed at the uncached input rate.
-  const snapshot = cloneStats();
-  const offTokens = contextSize(pruneContextMessages(messages, "off")).approxTokens;
-  const activePruned = mode === "full"
-    ? frozenResultFor(messages, pruneContextMessages(messages, "full"))
-    : pruneContextMessages(messages, mode);
-  const activeTokens = contextSize(activePruned).approxTokens;
-  restoreStats(snapshot);
-  const savedTokens = Math.max(0, offTokens - activeTokens);
+  if (!actual) { lastTurnCostSavedEstimate = 0; return; }
+  const savedTokens = Math.max(0, lastPromptSavedTokens);
   const { rate } = inputRateFromUsage(actual);
   if (savedTokens <= 0 || rate <= 0) { lastTurnCostSavedEstimate = 0; return; }
   lastTurnCostSavedEstimate = savedTokens * rate;
@@ -2300,6 +2287,8 @@ export default function cprune(pi: ExtensionAPI) {
     // reset it on start so the freeze re-establishes cleanly from this turn.
     committedPrefixCount = 0;
     committedPrefixForms = [];
+    committedPrefixRawHashes = [];
+    lastPromptSavedTokens = 0;
     ctx.ui.setStatus("cprune", `cprune: ${mode}`);
   });
 
@@ -2403,8 +2392,14 @@ export default function cprune(pi: ExtensionAPI) {
   });
 
   pi.on("context", (event) => {
-    if (mode === "off") return;
-    return { messages: contextHookPrune(event.messages, mode) };
+    const rawTokens = contextSize(event.messages).approxTokens;
+    if (mode === "off") {
+      lastPromptSavedTokens = 0;
+      return;
+    }
+    const messages = contextHookPrune(event.messages, mode);
+    lastPromptSavedTokens = Math.max(0, rawTokens - contextSize(messages).approxTokens);
+    return { messages };
   });
 
   pi.on("agent_end", (event, ctx) => {
