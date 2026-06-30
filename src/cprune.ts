@@ -2023,6 +2023,10 @@ function contextStatText(ctx: any): string {
   }
 
   out.push("");
+  out.push("Breakdown by context part (off / safe / full)");
+  out.push(...triBreakdownLines(off.beforeBreakdown, safe.afterBreakdown, full.afterBreakdown));
+
+  out.push("");
   out.push(...cacheImpactLines());
   return out.join("\n");
 }

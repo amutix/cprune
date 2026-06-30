@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.10 - 2026-06-30
+
+### Fixed
+- Restored the **per-category breakdown** (off/safe/full bars split by context part) in `/cprune`. It was unintentionally removed in v0.2.9 alongside the verbosity cleanup.
+
 ## v0.2.9 - 2026-06-30
 
 ### Changed
