@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.3 - 2026-06-30
+
+### Fixed
+- Corrected `/cprune` display semantics on prefix-cache providers: the `full` row now shows the **effective frozen-prefix prompt** that cprune would actually send, not fictional fresh full-pruning potential.
+- Kept the real v0.3.2 safe-floor optimization: where full is allowed to prune a message, it still prefers a smaller safe mechanical replacement over a larger full semantic replacement.
+- Updated README wording to make the cache-preservation tradeoff explicit: active full can sometimes show less immediate savings than safe because it preserves the already-sent prefix for cache stability.
+
 ## v0.3.2 - 2026-06-30
 
 ### Fixed

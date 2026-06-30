@@ -1731,7 +1731,7 @@ function simulatePrunedContext(ctx: any, pruneMode: CpruneMode) {
 
   const snapshot = cloneStats();
   const prunedMessages = pruneMode === "full"
-    ? pruneFullWithSafeFloor(rawMessages)
+    ? frozenResultFor(rawMessages, pruneFullWithSafeFloor(rawMessages))
     : pruneContextMessages(rawMessages, pruneMode);
   const passDelta = {
     staleReads: stats.contextStaleReads - snapshot.contextStaleReads,
@@ -1912,7 +1912,7 @@ function cacheImpactLines(): string[] {
       : "unknown cache model (prefix-cache assumed)";
   const lines = [`Cache model: ${modelLabel}`];
   if (mode === "full" && activeCacheModel === "prefix" && committedPrefixCount > 0) {
-    lines.push("  note: off/safe/full rows show fresh pruning potential; active full keeps the old prefix frozen for cache stability.");
+    lines.push("  note: full is shown with the active frozen prefix, because that is the prompt actually sent for cache stability.");
   }
   return lines;
 }

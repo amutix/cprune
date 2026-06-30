@@ -38,11 +38,11 @@ cprune
 Interpretation:
 
 - `off` is the raw prompt size with no cprune prompt-time pruning.
-- `safe` is fresh conservative pruning potential.
-- `full` is fresh aggressive pruning potential (`full` is kept at least as small as `safe` per message).
+- `safe` is the prompt size if safe mode were applied now.
+- `full` is the effective full-mode prompt size. On prefix-cache providers this includes the active frozen prefix, because that is what cprune actually sends to preserve cache stability.
 - `last turn` is the **actual provider-reported cache behavior** from the previous model call.
 - `est. saved this turn` is the actual prompt-token delta captured before the model call, priced with real billing data when available or clearly labeled assumed pricing otherwise.
-- On prefix-cache providers, active `full` may keep an old prefix frozen for cache stability; `/cprune` notes this when relevant.
+- Because active `full` may keep an old prefix frozen, it can occasionally show less immediate savings than `safe`; that is a cache-preservation tradeoff, not a cache prediction.
 
 ## Install
 
