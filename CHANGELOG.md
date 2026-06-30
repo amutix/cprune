@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.15 - 2026-06-30
+
+### Fixed
+- **Stats now survive reloads.** The cache-prediction baseline and cumulative session cost savings are persisted in cprune state, so the off/safe/full cache-hit estimates and the cumulative `est. saved session` no longer reset to blank/zero when you reload a session. (The committed-prefix freeze is still in-memory and re-establishes after one turn on reload, since persisting full message forms would bloat the session log.)
+
 ## v0.2.14 - 2026-06-30
 
 ### Changed

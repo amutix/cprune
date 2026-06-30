@@ -825,6 +825,14 @@ function loadStateFromSession(ctx: any) {
     lastActualUsage = stateEntry.data.lastActualUsage;
   }
   cumulativeCostSavedEstimate = Number(stateEntry.data.cumulativeCostSavedEstimate ?? 0);
+  // Restore the cache-prediction baseline so estimates continue across reloads.
+  const persisted = stateEntry.data.cacheBaseline;
+  if (persisted && typeof persisted === "object"
+    && persisted.off && Array.isArray(persisted.off.fps)
+    && persisted.safe && Array.isArray(persisted.safe.fps)
+    && persisted.full && Array.isArray(persisted.full.fps)) {
+    cacheBaseline = persisted as { off: FingerprintSet; safe: FingerprintSet; full: FingerprintSet };
+  }
 }
 
 function saveState(pi: ExtensionAPI) {
@@ -838,6 +846,12 @@ function saveState(pi: ExtensionAPI) {
     manualTurnOmissions: [...manualTurnOmissions.values()],
     lastActualUsage,
     cumulativeCostSavedEstimate,
+    // Persist the cache-prediction baseline so the off/safe/full cache-hit
+    // estimates survive reloads. This is just fingerprints (hashes + sizes),
+    // small and serializable. The committed-prefix freeze is NOT persisted
+    // (its message forms would bloat the session log), so it re-establishes
+    // after one turn on reload.
+    cacheBaseline,
     savedAt: Date.now(),
   });
 }
@@ -2400,9 +2414,12 @@ function maybeTriggerCompaction(ctx: any) {
 export default function cprune(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     loadStateFromSession(ctx);
+    // The committed-prefix freeze is in-memory (message forms are not persisted);
+    // reset it on start so the freeze re-establishes cleanly from this turn.
     committedPrefixCount = 0;
     committedPrefixForms = [];
-    cacheBaseline = undefined;
+    // cacheBaseline is restored by loadStateFromSession, so the cache prediction
+    // continues across reloads instead of going blank.
     ctx.ui.setStatus("cprune", `cprune: ${mode}`);
   });
 
