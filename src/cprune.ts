@@ -192,6 +192,7 @@ type ActualUsage = {
   cacheWrite: number;
   totalTokens: number;
   cost: number;
+  costInput: number;
   hitPct: number;
   model?: string;
   api?: string;
@@ -227,6 +228,15 @@ let lastActualUsage: ActualUsage | undefined;
 // providers (OpenAI/gpt, Anthropic). Only the new (uncommitted) tail is pruned.
 let committedPrefixCount = 0;
 let committedPrefixForms: AnyMessage[] = [];
+
+// Cost-savings estimate (cumulative across the session, persisted). At each turn we
+// estimate how much cprune saved vs running in `off` mode. Under the cache-aware
+// prefix-freeze, pruned tokens come from the uncommitted (new) tail, which would
+// otherwise be billed at the uncached input rate — so we price saved tokens at the
+// real per-token input rate derived from the last response's billing.
+let cumulativeCostSavedEstimate = 0;
+let lastTurnCostSavedEstimate = 0;
+let lastFootprintTokens: { off: number; safe: number; full: number } = { off: 0, safe: 0, full: 0 };
 
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex");
@@ -798,6 +808,7 @@ function loadStateFromSession(ctx: any) {
   if (stateEntry.data.lastActualUsage && typeof stateEntry.data.lastActualUsage === "object") {
     lastActualUsage = stateEntry.data.lastActualUsage;
   }
+  cumulativeCostSavedEstimate = Number(stateEntry.data.cumulativeCostSavedEstimate ?? 0);
 }
 
 function saveState(pi: ExtensionAPI) {
@@ -810,6 +821,7 @@ function saveState(pi: ExtensionAPI) {
     manualOmissions: [...manualOmissions.values()],
     manualTurnOmissions: [...manualTurnOmissions.values()],
     lastActualUsage,
+    cumulativeCostSavedEstimate,
     savedAt: Date.now(),
   });
 }
@@ -1865,6 +1877,11 @@ function trackCacheFingerprints(raw: AnyMessage[]): void {
     full: cacheModel(cacheBaseline?.full, fullFp),
   };
   cacheBaseline = { off: offFp, safe: safeFp, full: fullFp };
+  lastFootprintTokens = {
+    off: Math.ceil(offFp.sizes.reduce((s, n) => s + n, 0) / 4),
+    safe: Math.ceil(safeFp.sizes.reduce((s, n) => s + n, 0) / 4),
+    full: Math.ceil(fullFp.sizes.reduce((s, n) => s + n, 0) / 4),
+  };
 }
 
 function recordActualUsage(messages: AnyMessage[]): void {
@@ -1885,14 +1902,46 @@ function recordActualUsage(messages: AnyMessage[]): void {
       cacheWrite,
       totalTokens: Number(usage.totalTokens ?? 0),
       cost: Number(usage.cost?.total ?? 0),
+      costInput: Number(usage.cost?.input ?? 0),
       hitPct: denom > 0 ? (cacheRead / denom) * 100 : 0,
       model: typeof message.model === "string" ? message.model : undefined,
       api,
       provider,
     };
     activeCacheModel = detectCacheModel(api, provider);
+    estimateTurnCostSavings();
     return;
   }
+}
+
+// Estimate $ saved this turn vs running in `off` mode, and accumulate it.
+// Price per uncached input token is derived from real billing when available.
+// Real uncached input-token rate derived from billing, with a blended fallback.
+function inputRateFromUsage(actual: ActualUsage | undefined): number {
+  if (!actual) return 0;
+  if (actual.input > 0 && actual.costInput > 0) return actual.costInput / actual.input;
+  if (actual.totalTokens > 0 && actual.cost > 0) return actual.cost / actual.totalTokens;
+  return 0;
+}
+
+function fmtMoney(value: number): string {
+  if (value <= 0) return "$0.00";
+  if (value < 0.01) return `<$0.01`;
+  if (value < 1) return `$${value.toFixed(4)}`;
+  return `$${value.toFixed(2)}`;
+}
+
+function estimateTurnCostSavings(): void {
+  const actual = lastActualUsage;
+  if (!actual) { lastTurnCostSavedEstimate = 0; return; }
+  const activeTokens = mode === "safe" ? lastFootprintTokens.safe : mode === "full" ? lastFootprintTokens.full : lastFootprintTokens.off;
+  const savedTokens = Math.max(0, lastFootprintTokens.off - activeTokens);
+  const inputRate = inputRateFromUsage(actual);
+  if (savedTokens <= 0 || inputRate <= 0) { lastTurnCostSavedEstimate = 0; return; }
+  // Under the cache-aware freeze, pruned tokens are uncached new-tail tokens, so
+  // billing them at the input rate is a fair estimate of what they would have cost.
+  lastTurnCostSavedEstimate = savedTokens * inputRate;
+  cumulativeCostSavedEstimate += lastTurnCostSavedEstimate;
 }
 
 // Relative cost index for a prediction, using the typical provider economics:
@@ -1909,42 +1958,28 @@ function cacheImpactLines(): string[] {
   const safe = cachePrediction.safe;
   const full = cachePrediction.full;
   const baselineReady = off.hasBaseline || safe.hasBaseline || full.hasBaseline;
-  // Which cache model to headline. "auto" = provider unknown yet → be conservative (prefix).
   const useContent = activeCacheModel === "content";
   const modelLabel = activeCacheModel === "content"
-    ? "content/block reuse (zai/glm-style)"
+    ? "content-cache (re-uses blocks after a change)"
     : activeCacheModel === "prefix"
-      ? "strict prefix (openai/anthropic-style)"
-      : "unknown provider → strict prefix (conservative)";
-  const lines: string[] = [``, `Cache impact (predicted vs previous turn; ${modelLabel}; no extra LLM calls)`];
+      ? "prefix-cache (change invalidates the tail)"
+      : "unknown cache model (prefix-cache assumed)";
+  const lines: string[] = [`Cache: ${modelLabel}`];
   if (!baselineReady) {
-    lines.push("  collecting baseline — run one more turn to compare cache hits");
+    lines.push("  predicting vs previous turn — run one more turn for cache impact");
     return lines;
   }
   const hitPct = (p: CachePrediction) => (useContent ? p.contentHitPct : p.prefixHitPct);
-  const miss = (p: CachePrediction) => (useContent ? p.contentMissTokens : p.prefixMissTokens);
-  const offCost = relativeCacheCost(off, useContent);
-  const row = (label: string, p: CachePrediction) => {
-    const extraMiss = Math.max(0, miss(p) - (off.hasBaseline ? miss(off) : 0));
-    const breakNote = p.hasBaseline && p.breakAt < p.totalTokens ? ` first-change@${fmtInt(p.breakAt)}` : "";
-    const costIdx = offCost > 0 ? relativeCacheCost(p, useContent) / offCost : 1;
-    const tail = useContent ? "" : `  (content-cache providers may do better — compare to actual below)`;
-    return `  ${label.padEnd(5)} read ${hitPct(p).toFixed(0).padStart(3)}%  miss ~${fmtInt(miss(p))} tok  vs-off +${fmtInt(extraMiss)}${breakNote}  cost×${costIdx.toFixed(2)}${tail}`;
-  };
+  const row = (label: string, p: CachePrediction) =>
+    `  ${label.padEnd(5)} ${hitPct(p).toFixed(0).padStart(3)}% cache hit   change@${p.breakAt < p.totalTokens ? fmtInt(p.breakAt) : "end"}`;
   lines.push(row("off", off), row("safe", safe), row("full", full));
 
-  // Recommendation: full mode is cache-hostile on prefix-sensitive providers.
+  // Recommend safe mode when full is cache-hostile on a prefix-sensitive provider.
   if (mode === "full" && !useContent && full.hasBaseline) {
-    const fullCostIdx = offCost > 0 ? relativeCacheCost(full, useContent) / offCost : 1;
+    const fullCostIdx = relativeCacheCost(off, false) > 0 ? relativeCacheCost(full, false) / relativeCacheCost(off, false) : 1;
     if (fullCostIdx >= 1.3) {
-      lines.push(`  ⚠ full mode costs ×${fullCostIdx.toFixed(2)} of off on prefix-cache providers here — consider /cprune safe`);
+      lines.push(`  ⚠ full mode breaks the cache here (×${fullCostIdx.toFixed(2)} cost) — consider /cprune safe`);
     }
-  }
-
-  const actual = lastActualUsage;
-  if (actual && actual.totalTokens > 0) {
-    const denom = actual.cacheRead + actual.input + actual.cacheWrite;
-    lines.push("", `Last response (actual, ${actual.model ?? "model"}${actual.provider ? ` via ${actual.provider}` : ""}): cache-read ${actual.hitPct.toFixed(0)}%, in ${fmtInt(actual.input)}/write ${fmtInt(actual.cacheWrite)}/read ${fmtInt(actual.cacheRead)} tok${denom > 0 ? "" : " (no cache stats)"}, out ${fmtInt(actual.output)} tok${actual.cost > 0 ? `, cost $${actual.cost.toFixed(4)}` : ""}`);
   }
   return lines;
 }
@@ -1954,34 +1989,42 @@ function contextStatText(ctx: any): string {
   const safe = simulatePrunedContext(ctx, "safe");
   const full = simulatePrunedContext(ctx, "full");
   const usage = ctx.getContextUsage?.();
-  const modelUsage = usage
-    ? `${usage.tokens ?? "unknown"}/${usage.contextWindow} tokens (${usage.percent?.toFixed(1) ?? "?"}%)`
-    : "unknown";
+  const actual = lastActualUsage;
+  const inputRate = inputRateFromUsage(actual);
+  const hasCost = inputRate > 0;
 
-  const safeSaved = Math.max(0, off.before.chars - safe.after.chars);
-  const fullSaved = Math.max(0, off.before.chars - full.after.chars);
-  const safePct = off.before.chars > 0 ? (safeSaved / off.before.chars) * 100 : 0;
-  const fullPct = off.before.chars > 0 ? (fullSaved / off.before.chars) * 100 : 0;
+  const costSaved = (modeTokens: number) => hasCost ? Math.max(0, off.before.approxTokens - modeTokens) * inputRate : 0;
+  const safeSavedTok = Math.max(0, off.before.approxTokens - safe.after.approxTokens);
+  const fullSavedTok = Math.max(0, off.before.approxTokens - full.after.approxTokens);
 
-  return [
-    `${BRIGHT_TEXT}cprune`,
-    "",
-    "Summary",
-    `  active mode       : ${mode}`,
-    `  model context     : ${modelUsage}`,
-    `  messages          : ${fmtInt(off.before.messages)} total, safe touches ${fmtInt(safe.passDelta.touched)}, full touches ${fmtInt(full.passDelta.touched)}`,
-    `  user exclusions   : ${fmtInt(manualOmissions.size + manualTurnOmissions.size)}`,
-    `  persisted savings : ${fmtInt(stats.approxCharsSaved)} chars; tool results dup/norm/append/trunc ${fmtInt(stats.toolResultsDeduped)}/${fmtInt(stats.toolResultsNormalizedDeduped)}/${fmtInt(stats.toolResultsAppendPruned)}/${fmtInt(stats.toolResultsTruncated)}`,
-    "",
-    "Mode comparison",
-    `  off   ${colorBar(off.before.chars, off.before.chars, "off")} ${fmtInt(off.before.chars)} chars  ~${fmtInt(off.before.approxTokens)} tok  0 saved`,
-    `  safe  ${colorBar(safe.after.chars, off.before.chars, "safe")} ${fmtInt(safe.after.chars)} chars  ~${fmtInt(safe.after.approxTokens)} tok  saved ${fmtInt(safeSaved)} (${fmtPct(safePct)})`,
-    `  full  ${colorBar(full.after.chars, off.before.chars, "full")} ${fmtInt(full.after.chars)} chars  ~${fmtInt(full.after.approxTokens)} tok  saved ${fmtInt(fullSaved)} (${fmtPct(fullPct)})`,
-    "",
-    "Breakdown by context part (off / safe / full)",
-    ...triBreakdownLines(off.beforeBreakdown, safe.afterBreakdown, full.afterBreakdown),
-    ...cacheImpactLines(),
-  ].join("\n");
+  const out: string[] = [`${BRIGHT_TEXT}cprune`, ""];
+
+  const headerBits = [`mode: ${mode}`];
+  if (actual?.model) headerBits.push(`${actual.model}${actual.provider ? ` via ${actual.provider}` : ""}`);
+  if (usage) headerBits.push(`${usage.tokens ?? "unknown"}/${usage.contextWindow} tok (${usage.percent?.toFixed(1) ?? "?"}%)`);
+  out.push(`  ${headerBits.join("  ·  ")}`);
+
+  const lastTurnBits: string[] = [];
+  if (actual && actual.totalTokens > 0) {
+    lastTurnBits.push(`${actual.hitPct.toFixed(0)}% cache hit`);
+    if (actual.cost > 0) lastTurnBits.push(fmtMoney(actual.cost));
+  }
+  if (lastTurnBits.length) out.push(`  last turn: ${lastTurnBits.join("  ·  ")}`);
+
+  out.push("");
+  out.push(`  off   ${colorBar(off.before.chars, off.before.chars, "off")} ${fmtInt(off.before.approxTokens)} tok`);
+  out.push(`  safe  ${colorBar(safe.after.chars, off.before.chars, "safe")} ${fmtInt(safe.after.approxTokens)} tok   −${fmtInt(safeSavedTok)}${hasCost ? `  ${fmtMoney(costSaved(safe.after.approxTokens))}` : ""}`);
+  out.push(`  full  ${colorBar(full.after.chars, off.before.chars, "full")} ${fmtInt(full.after.approxTokens)} tok   −${fmtInt(fullSavedTok)}${hasCost ? `  ${fmtMoney(costSaved(full.after.approxTokens))}` : ""}`);
+
+  if (hasCost) {
+    out.push("");
+    out.push(`  est. saved this turn : ${fmtMoney(lastTurnCostSavedEstimate)}`);
+    out.push(`  est. saved session   : ${fmtMoney(cumulativeCostSavedEstimate)}`);
+  }
+
+  out.push("");
+  out.push(...cacheImpactLines());
+  return out.join("\n");
 }
 
 type ReviewCandidate = {

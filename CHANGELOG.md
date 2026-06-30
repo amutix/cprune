@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.9 - 2026-06-30
+
+### Changed
+- **Redesigned `/cprune` output** to be concise and cost-aware. The verbose summary, per-category breakdown, and dense cache rows were replaced with a compact layout: a one-line header (mode · model · context usage), last-turn cache hit + cost, a clean off/safe/full token bar with per-mode savings, and estimated **cost savings** (this turn + cumulative session).
+
+### Added
+- **Estimated cost savings** derived from real per-token billing (`usage.cost.input / input`, with a blended fallback). Under the cache-aware prefix-freeze, pruned tokens are uncached new-tail tokens, so pricing them at the real input rate is a fair estimate of money saved.
+- Cumulative session cost savings persisted across turns.
+
 ## v0.2.8 - 2026-06-30
 
 ### Fixed

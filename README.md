@@ -24,6 +24,7 @@ Entity-aware pruning is generic rather than tied to one extension: it detects ID
 Prompt caching makes long context cheap when consecutive turns share a stable prefix. Pruning that changes an older message retroactively breaks that prefix, turning cheap cached reads into expensive misses. cprune's `/cprune` comparison now shows this tradeoff explicitly:
 
 - **Predicted cache hit** per mode (off/safe/full) computed offline with a **provider-aware** model. Because providers cache differently, cprune detects the cache model from the response (`api`/`provider`) and headlines the matching one: strict-prefix for OpenAI/gpt/Anthropic (a retroactive change invalidates the cached tail), content/block-reuse for zai/glm gateways. No extra model calls are made.
+- **Estimated cost savings** derived from real per-token billing, shown per mode and accumulated across the session.
 - A recommendation appears when `full` mode costs ≥1.3× of `off` on a prefix-sensitive provider.
 - **Relative cost index** using provider economics (cached reads ≈ 0.1×, misses/cache-writes ≈ 1.25×), so you can see when `full` mode's token savings are outweighed by cache penalties.
 - **Actual cache stats** read from the live response (`cacheRead`, `cacheWrite`, `input`, `cost`) to validate the prediction.
@@ -92,7 +93,7 @@ Or install/configure it as a Pi package; `package.json` exposes `src/cprune.ts` 
 
 cprune also registers an LLM-callable tool named `cprune_status`. Omitting `action` returns the same off/safe/full comparison as `/cprune`; actions `safe`, `full`, `off`, and `compact` change mode or request lossy compaction.
 
-`/cprune` works in any mode, so you can compare estimated savings before enabling pruning. The output compares **off** (red), **safe** (orange), and **full** (green), includes a few useful state counters, then shows the concise context-part breakdown.
+`/cprune` shows a compact cost-aware view:
 
 `/cprune review-prompts [safe|full] [N] [page]` is useful after accidentally pushing a noisy prompt/response/tool-output turn into context. Safe mode is the default and mirrors Pi prompt behavior: it skips hidden shell entries such as `!!cmd` because Pi marks them `excludeFromContext`, while keeping normal `!cmd` entries as selectable shell-command items. Full mode shows raw branch history, including hidden `!!cmd` entries, for users who want complete visibility. The selected turn is excluded from future prompts when it appears in model context; Pi session entries are not deleted. Results are paginated; jump directly with e.g. `/cprune review-prompts safe 50 2` or `/cprune review-prompts full 50`.
 
