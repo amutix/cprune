@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.11 - 2026-06-30
+
+### Fixed
+- **Cost estimates now always show.** Previously, when a provider reported no billing (e.g. zai/glm gateways reporting `$0` cost), all cost/savings numbers were suppressed. Cost now falls back to **assumed model pricing** (configurable per model prefix, default $0.50/M tokens) and is labeled `(assumed pricing)` so it's honest about the source. Providers that report real billing (gpt, claude, etc.) continue to use the actual per-token rate with no label.
+- Added a `modelInputPricePerMTok` config table for common models (gpt, o1/o3, claude variants, glm, gemini, deepseek, llama) plus a `fallbackInputPricePerMTok` default.
+
 ## v0.2.10 - 2026-06-30
 
 ### Fixed

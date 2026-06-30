@@ -1,6 +1,6 @@
 {
   "name": "cprune-pi-extension",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "Pi extension for safe/full context pruning, prompt review, and compact off/safe/full context comparisons.",
   "license": "MIT",
   "type": "module",

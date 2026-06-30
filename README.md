@@ -24,7 +24,8 @@ Entity-aware pruning is generic rather than tied to one extension: it detects ID
 Prompt caching makes long context cheap when consecutive turns share a stable prefix. Pruning that changes an older message retroactively breaks that prefix, turning cheap cached reads into expensive misses. cprune's `/cprune` comparison now shows this tradeoff explicitly:
 
 - **Predicted cache hit** per mode (off/safe/full) computed offline with a **provider-aware** model. Because providers cache differently, cprune detects the cache model from the response (`api`/`provider`) and headlines the matching one: strict-prefix for OpenAI/gpt/Anthropic (a retroactive change invalidates the cached tail), content/block-reuse for zai/glm gateways. No extra model calls are made.
-- **Estimated cost savings** derived from real per-token billing, shown per mode and accumulated across the session.
+- **Estimated cost savings** derived from real per-token billing (`usage.cost.input / input`, with a blended fallback). When a provider reports no cost, cprune falls back to assumed model pricing (configurable via `modelInputPricePerMTok` / `fallbackInputPricePerMTok`) and labels it `(assumed pricing)`. Under the cache-aware prefix-freeze, pruned tokens are uncached new-tail tokens, so pricing them at the input rate is a fair estimate of money saved.
+- Cumulative session cost savings persisted across turns.
 - A recommendation appears when `full` mode costs ≥1.3× of `off` on a prefix-sensitive provider.
 - **Relative cost index** using provider economics (cached reads ≈ 0.1×, misses/cache-writes ≈ 1.25×), so you can see when `full` mode's token savings are outweighed by cache penalties.
 - **Actual cache stats** read from the live response (`cacheRead`, `cacheWrite`, `input`, `cost`) to validate the prediction.

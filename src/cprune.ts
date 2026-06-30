@@ -98,6 +98,22 @@ const config = {
   // Background compaction trigger. Set to 0 to disable.
   autoCompactAtPercent: 82,
   compactCooldownMs: 10 * 60 * 1_000,
+
+  // Fallback pricing (USD per 1M tokens) when the provider reports no cost.
+  // Used only for savings estimates, never billed. Keyed by lowercase model prefix.
+  fallbackInputPricePerMTok: 0.5,
+  modelInputPricePerMTok: {
+    gpt: 1.25,
+    o1: 15,
+    o3: 10,
+    "claude-opus": 15,
+    "claude-sonnet": 3,
+    "claude-haiku": 0.8,
+    "glm": 0.5,
+    "gemini": 1.25,
+    deepseek: 0.27,
+    llama: 0.2,
+  },
 };
 
 const stats: CpruneStats = {
@@ -1916,12 +1932,24 @@ function recordActualUsage(messages: AnyMessage[]): void {
 
 // Estimate $ saved this turn vs running in `off` mode, and accumulate it.
 // Price per uncached input token is derived from real billing when available.
-// Real uncached input-token rate derived from billing, with a blended fallback.
-function inputRateFromUsage(actual: ActualUsage | undefined): number {
-  if (!actual) return 0;
-  if (actual.input > 0 && actual.costInput > 0) return actual.costInput / actual.input;
-  if (actual.totalTokens > 0 && actual.cost > 0) return actual.cost / actual.totalTokens;
-  return 0;
+function pricePerMTokForModel(model: string | undefined): number {
+  if (!model) return config.fallbackInputPricePerMTok;
+  const m = model.toLowerCase();
+  for (const [prefix, price] of Object.entries(config.modelInputPricePerMTok)) {
+    if (m.includes(prefix)) return price;
+  }
+  return config.fallbackInputPricePerMTok;
+}
+
+// Real uncached input-token rate derived from billing, with a model-pricing fallback.
+// `real` is false when we fell back to assumed pricing (provider reported no cost).
+function inputRateFromUsage(actual: ActualUsage | undefined): { rate: number; real: boolean } {
+  if (actual && actual.input > 0 && actual.costInput > 0) {
+    return { rate: actual.costInput / actual.input, real: true };
+  }
+  // Provider reported no usable billing → assume pricing from the model name.
+  const price = pricePerMTokForModel(actual?.model);
+  return { rate: price / 1_000_000, real: false };
 }
 
 function fmtMoney(value: number): string {
@@ -1936,11 +1964,11 @@ function estimateTurnCostSavings(): void {
   if (!actual) { lastTurnCostSavedEstimate = 0; return; }
   const activeTokens = mode === "safe" ? lastFootprintTokens.safe : mode === "full" ? lastFootprintTokens.full : lastFootprintTokens.off;
   const savedTokens = Math.max(0, lastFootprintTokens.off - activeTokens);
-  const inputRate = inputRateFromUsage(actual);
-  if (savedTokens <= 0 || inputRate <= 0) { lastTurnCostSavedEstimate = 0; return; }
+  const { rate } = inputRateFromUsage(actual);
+  if (savedTokens <= 0 || rate <= 0) { lastTurnCostSavedEstimate = 0; return; }
   // Under the cache-aware freeze, pruned tokens are uncached new-tail tokens, so
   // billing them at the input rate is a fair estimate of what they would have cost.
-  lastTurnCostSavedEstimate = savedTokens * inputRate;
+  lastTurnCostSavedEstimate = savedTokens * rate;
   cumulativeCostSavedEstimate += lastTurnCostSavedEstimate;
 }
 
@@ -1990,12 +2018,12 @@ function contextStatText(ctx: any): string {
   const full = simulatePrunedContext(ctx, "full");
   const usage = ctx.getContextUsage?.();
   const actual = lastActualUsage;
-  const inputRate = inputRateFromUsage(actual);
-  const hasCost = inputRate > 0;
+  const { rate: inputRate, real: costIsReal } = inputRateFromUsage(actual);
 
-  const costSaved = (modeTokens: number) => hasCost ? Math.max(0, off.before.approxTokens - modeTokens) * inputRate : 0;
+  const costSaved = (modeTokens: number) => Math.max(0, off.before.approxTokens - modeTokens) * inputRate;
   const safeSavedTok = Math.max(0, off.before.approxTokens - safe.after.approxTokens);
   const fullSavedTok = Math.max(0, off.before.approxTokens - full.after.approxTokens);
+  const costTag = costIsReal ? "" : "  (assumed pricing)";
 
   const out: string[] = [`${BRIGHT_TEXT}cprune`, ""];
 
@@ -2013,14 +2041,12 @@ function contextStatText(ctx: any): string {
 
   out.push("");
   out.push(`  off   ${colorBar(off.before.chars, off.before.chars, "off")} ${fmtInt(off.before.approxTokens)} tok`);
-  out.push(`  safe  ${colorBar(safe.after.chars, off.before.chars, "safe")} ${fmtInt(safe.after.approxTokens)} tok   −${fmtInt(safeSavedTok)}${hasCost ? `  ${fmtMoney(costSaved(safe.after.approxTokens))}` : ""}`);
-  out.push(`  full  ${colorBar(full.after.chars, off.before.chars, "full")} ${fmtInt(full.after.approxTokens)} tok   −${fmtInt(fullSavedTok)}${hasCost ? `  ${fmtMoney(costSaved(full.after.approxTokens))}` : ""}`);
+  out.push(`  safe  ${colorBar(safe.after.chars, off.before.chars, "safe")} ${fmtInt(safe.after.approxTokens)} tok   −${fmtInt(safeSavedTok)}  ${fmtMoney(costSaved(safe.after.approxTokens))}`);
+  out.push(`  full  ${colorBar(full.after.chars, off.before.chars, "full")} ${fmtInt(full.after.approxTokens)} tok   −${fmtInt(fullSavedTok)}  ${fmtMoney(costSaved(full.after.approxTokens))}`);
 
-  if (hasCost) {
-    out.push("");
-    out.push(`  est. saved this turn : ${fmtMoney(lastTurnCostSavedEstimate)}`);
-    out.push(`  est. saved session   : ${fmtMoney(cumulativeCostSavedEstimate)}`);
-  }
+  out.push("");
+  out.push(`  est. saved this turn : ${fmtMoney(lastTurnCostSavedEstimate)}${costTag}`);
+  out.push(`  est. saved session   : ${fmtMoney(cumulativeCostSavedEstimate)}${costTag}`);
 
   out.push("");
   out.push("Breakdown by context part (off / safe / full)");
