@@ -181,26 +181,17 @@ let compactInFlight = false;
 let mode: CpruneMode = "full";
 let cpruneCompactionRequest: { reason: string; requestedAt: number } | undefined;
 
-// --- Cache-impact tracking (Tier 1: offline prefix model, Tier 2: real usage) ---
-// Providers cache prompts differently. OpenAI/gpt and Anthropic block-cache are
-// prefix-sensitive: retroactively changing an old message invalidates the cached
-// tail. Some gateways (e.g. zai/glm) cache by content/block and re-serve unchanged
-// messages even after a prefix break. We fingerprint each message per mode every
-// turn to predict cache hit without any LLM call, and pick the model that matches
-// the active provider.
-type FingerprintSet = { fps: string[]; sizes: number[] };
+// --- Cache handling ---
+// We DO NOT predict cache hit. Earlier versions built an offline fingerprint
+// model to predict cache hit per mode, but it was reliably wrong (it predicted
+// 0% on providers that measured ~98%), which made the output misleading and
+// undermined trust. Instead we report only the REAL measured cache hit returned
+// by the provider in the last response (cacheRead / denom), plus deterministic
+// token/char savings. The only cache-aware *action* we keep is the prefix freeze
+// (see contextHookPrune): on prefix-sensitive providers, once a message's pruned
+// form is sent we freeze it so the prompt prefix stays byte-identical across
+// turns. The freeze is gated on the provider's cache model below.
 type CacheModel = "prefix" | "content" | "auto";
-type CachePrediction = {
-  // Worst case: strict prefix only (OpenAI/gpt-style). prefix break = lose the tail.
-  prefixHitPct: number;
-  prefixMissTokens: number;
-  // Best case: content/block reuse (glm-style). unchanged messages after the break re-serve.
-  contentHitPct: number;
-  contentMissTokens: number;
-  totalTokens: number;
-  breakAt: number;
-  hasBaseline: boolean;
-};
 type ActualUsage = {
   input: number;
   output: number;
@@ -214,7 +205,6 @@ type ActualUsage = {
   api?: string;
   provider?: string;
 };
-const emptyPrediction = (): CachePrediction => ({ prefixHitPct: 0, prefixMissTokens: 0, contentHitPct: 0, contentMissTokens: 0, totalTokens: 0, breakAt: 0, hasBaseline: false });
 function detectCacheModel(api: unknown, provider: unknown): CacheModel {
   const a = String(api ?? "").toLowerCase();
   const p = String(provider ?? "").toLowerCase();
@@ -231,12 +221,6 @@ function detectCacheModel(api: unknown, provider: unknown): CacheModel {
   return "auto";
 }
 let activeCacheModel: CacheModel = "auto";
-let cacheBaseline: { off: FingerprintSet; safe: FingerprintSet; full: FingerprintSet } | undefined;
-let cachePrediction: { off: CachePrediction; safe: CachePrediction; full: CachePrediction } = {
-  off: emptyPrediction(),
-  safe: emptyPrediction(),
-  full: emptyPrediction(),
-};
 let lastActualUsage: ActualUsage | undefined;
 // Cache-aware prefix freezing (see contextHookPrune). Once a message's pruned
 // form is sent to the model, that form is frozen so the prompt prefix stays
@@ -246,19 +230,13 @@ let committedPrefixCount = 0;
 let committedPrefixForms: AnyMessage[] = [];
 
 // Cost-savings estimate (cumulative across the session, persisted). At each turn we
-// estimate how much cprune saved vs running in `off` mode. Under the cache-aware
-// prefix-freeze, pruned tokens come from the uncommitted (new) tail, which would
-// otherwise be billed at the uncached input rate — so we price saved tokens at the
-// real per-token input rate derived from the last response's billing.
+// estimate how much cprune saved vs running in `off` mode, derived deterministically
+// from the off-vs-active token delta. Under the cache-aware prefix-freeze, pruned
+// tokens come from the uncommitted (new) tail, which would otherwise be billed at
+// the uncached input rate — so we price saved tokens at the real per-token input
+// rate derived from the last response's billing.
 let cumulativeCostSavedEstimate = 0;
 let lastTurnCostSavedEstimate = 0;
-let lastFootprintTokens: { off: number; safe: number; full: number } = { off: 0, safe: 0, full: 0 };
-// Set on the turn where history shrinks (compaction / branch switch / undo) and
-// cleared on the next live turn. While set, the cache prediction has no valid
-// reference frame (the provider's cache was just invalidated by the history
-// replacement), so the display explains the low real hit instead of showing a
-// misleading self-comparison.
-let compactionRebuildPending = false;
 
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex");
@@ -836,14 +814,6 @@ function loadStateFromSession(ctx: any) {
   }
   cumulativeCostSavedEstimate = Number(stateEntry.data.cumulativeCostSavedEstimate ?? 0);
   lastTurnCostSavedEstimate = Number(stateEntry.data.lastTurnCostSavedEstimate ?? 0);
-  // Restore the cache-prediction baseline so estimates continue across reloads.
-  const persisted = stateEntry.data.cacheBaseline;
-  if (persisted && typeof persisted === "object"
-    && persisted.off && Array.isArray(persisted.off.fps)
-    && persisted.safe && Array.isArray(persisted.safe.fps)
-    && persisted.full && Array.isArray(persisted.full.fps)) {
-    cacheBaseline = persisted as { off: FingerprintSet; safe: FingerprintSet; full: FingerprintSet };
-  }
 }
 
 function saveState(pi: ExtensionAPI) {
@@ -858,12 +828,6 @@ function saveState(pi: ExtensionAPI) {
     lastActualUsage,
     cumulativeCostSavedEstimate,
     lastTurnCostSavedEstimate,
-    // Persist the cache-prediction baseline so the off/safe/full cache-hit
-    // estimates survive reloads. This is just fingerprints (hashes + sizes),
-    // small and serializable. The committed-prefix freeze is NOT persisted
-    // (its message forms would bloat the session log), so it re-establishes
-    // after one turn on reload.
-    cacheBaseline,
     savedAt: Date.now(),
   });
 }
@@ -1823,59 +1787,6 @@ function simulatePrunedContext(ctx: any, pruneMode: CpruneMode) {
   };
 }
 
-function fingerprintsFor(messages: AnyMessage[]): FingerprintSet {
-  return {
-    fps: messages.map((message) => shortHash(hashText(safeJson(message, 100_000)))),
-    sizes: messages.map((message) => roughMessageChars(message)),
-  };
-}
-
-function cacheModel(prev: FingerprintSet | undefined, curr: FingerprintSet): CachePrediction {
-  const totalChars = curr.sizes.reduce((sum, size) => sum + size, 0);
-  const totalTokens = Math.ceil(totalChars / 4);
-  if (!prev || prev.fps.length === 0) {
-    return { prefixHitPct: 0, prefixMissTokens: totalTokens, contentHitPct: 0, contentMissTokens: totalTokens, totalTokens, breakAt: 0, hasBaseline: false };
-  }
-  const n = Math.min(prev.fps.length, curr.fps.length);
-  // 1) Strict prefix: walk until the first divergence. Up to here is a definite
-  //    cache read on ANY provider (prefix-sensitive or content-based).
-  let prefixChars = 0;
-  let breakAt = n;
-  for (let i = 0; i < n; i++) {
-    if (prev.fps[i] !== curr.fps[i]) { breakAt = i; break; }
-    prefixChars += curr.sizes[i];
-  }
-  // 2) Content reuse after the break: some providers (glm gateways, etc.) re-serve
-  //    unchanged messages even after the strict prefix breaks. Count remaining
-  //    prev fingerprints (after removing the prefix-consumed ones) and match.
-  const available = new Map<string, number>();
-  for (const fp of prev.fps) available.set(fp, (available.get(fp) ?? 0) + 1);
-  for (let i = 0; i < breakAt; i++) {
-    const fp = prev.fps[i];
-    available.set(fp, (available.get(fp) ?? 0) - 1);
-  }
-  let reuseChars = 0;
-  for (let i = breakAt; i < curr.fps.length; i++) {
-    const fp = curr.fps[i];
-    const left = available.get(fp) ?? 0;
-    if (left > 0) {
-      available.set(fp, left - 1);
-      reuseChars += curr.sizes[i];
-    }
-  }
-  const prefixReadTokens = Math.ceil(prefixChars / 4);
-  const contentReadTokens = Math.ceil((prefixChars + reuseChars) / 4);
-  return {
-    prefixHitPct: totalTokens > 0 ? (prefixReadTokens / totalTokens) * 100 : 0,
-    prefixMissTokens: Math.max(0, totalTokens - prefixReadTokens),
-    contentHitPct: totalTokens > 0 ? (contentReadTokens / totalTokens) * 100 : 0,
-    contentMissTokens: Math.max(0, totalTokens - contentReadTokens),
-    totalTokens,
-    breakAt,
-    hasBaseline: true,
-  };
-}
-
 function frozenResultFor(rawMessages: AnyMessage[], aggressive: AnyMessage[]): AnyMessage[] {
   // No freezing on content-cache providers (no cache penalty there) or before
   // anything is committed. If history shrank (e.g. after compaction) the committed
@@ -1904,54 +1815,6 @@ function contextHookPrune(rawMessages: AnyMessage[], pruneMode: CpruneMode): Any
   return result;
 }
 
-function refreshCachePrediction(raw: AnyMessage[], commit: boolean): void {
-  // Detect history shrink (compaction / branch switch / undo): a normal turn
-  // only ever appends messages, so a smaller message count than the last
-  // committed baseline means the history was replaced. The provider's cache is
-  // invalidated by that replacement, so the prior fingerprints are meaningless —
-  // drop the baseline and flag a rebuild so the display explains the low real
-  // hit instead of showing a trivial self-comparison.
-  let shrunk = false;
-  if (cacheBaseline && raw.length < cacheBaseline.off.fps.length) {
-    cacheBaseline = undefined;
-    shrunk = true;
-  }
-  const offFp = fingerprintsFor(raw);
-  const snapshot = cloneStats();
-  const safePruned = pruneContextMessages(raw, "safe");
-  const fullPruned = frozenResultFor(raw, pruneContextMessages(raw, "full"));
-  restoreStats(snapshot);
-  const safeFp = fingerprintsFor(safePruned);
-  const fullFp = fingerprintsFor(fullPruned);
-
-  cachePrediction = {
-    off: cacheModel(cacheBaseline?.off, offFp),
-    safe: cacheModel(cacheBaseline?.safe, safeFp),
-    full: cacheModel(cacheBaseline?.full, fullFp),
-  };
-  lastFootprintTokens = {
-    off: Math.ceil(offFp.sizes.reduce((s, n) => s + n, 0) / 4),
-    safe: Math.ceil(safeFp.sizes.reduce((s, n) => s + n, 0) / 4),
-    full: Math.ceil(fullFp.sizes.reduce((s, n) => s + n, 0) / 4),
-  };
-  // Only the live context hook advances the baseline. On the compaction turn we
-  // deliberately do NOT commit (the self-comparison would be misleading); the
-  // flag stays set so the display explains the rebuild, and the next live turn
-  // commits a fresh baseline and clears the flag.
-  if (commit) {
-    if (shrunk) {
-      compactionRebuildPending = true;
-    } else {
-      compactionRebuildPending = false;
-      cacheBaseline = { off: offFp, safe: safeFp, full: fullFp };
-    }
-  }
-}
-
-function trackCacheFingerprints(raw: AnyMessage[]): void {
-  refreshCachePrediction(raw, true);
-}
-
 function recordActualUsage(messages: AnyMessage[]): void {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i] as any;
@@ -1977,7 +1840,7 @@ function recordActualUsage(messages: AnyMessage[]): void {
       provider,
     };
     activeCacheModel = detectCacheModel(api, provider);
-    estimateTurnCostSavings();
+    estimateTurnCostSavings(messages);
     return;
   }
 }
@@ -2011,69 +1874,41 @@ function fmtMoney(value: number): string {
   return `$${value.toFixed(2)}`;
 }
 
-function estimateTurnCostSavings(): void {
+function estimateTurnCostSavings(messages: AnyMessage[]): void {
   const actual = lastActualUsage;
-  if (!actual) { lastTurnCostSavedEstimate = 0; return; }
-  const activeTokens = mode === "safe" ? lastFootprintTokens.safe : mode === "full" ? lastFootprintTokens.full : lastFootprintTokens.off;
-  const savedTokens = Math.max(0, lastFootprintTokens.off - activeTokens);
+  if (!actual || !messages.length) { lastTurnCostSavedEstimate = 0; return; }
+  // Deterministic off-vs-active token delta — the SAME math the /cprune display
+  // uses for its bars. No prediction: we don't model how the provider caches the
+  // pruned tokens, we just price the saved (uncached new-tail) tokens at the real
+  // input rate. Under the cache-aware freeze these are exactly the tokens that
+  // would otherwise be billed at the uncached input rate.
+  const snapshot = cloneStats();
+  const offTokens = contextSize(pruneContextMessages(messages, "off")).approxTokens;
+  const activePruned = mode === "full"
+    ? frozenResultFor(messages, pruneContextMessages(messages, "full"))
+    : pruneContextMessages(messages, mode);
+  const activeTokens = contextSize(activePruned).approxTokens;
+  restoreStats(snapshot);
+  const savedTokens = Math.max(0, offTokens - activeTokens);
   const { rate } = inputRateFromUsage(actual);
   if (savedTokens <= 0 || rate <= 0) { lastTurnCostSavedEstimate = 0; return; }
-  // Under the cache-aware freeze, pruned tokens are uncached new-tail tokens, so
-  // billing them at the input rate is a fair estimate of what they would have cost.
   lastTurnCostSavedEstimate = savedTokens * rate;
   cumulativeCostSavedEstimate += lastTurnCostSavedEstimate;
 }
 
-// Relative cost index for a prediction, using the typical provider economics:
-// cached reads ~0.1x, cache writes / uncached input ~1.25x (Anthropic cache write premium).
-// `useContent` picks which hit/miss field to price (provider-dependent).
-function relativeCacheCost(prediction: CachePrediction, useContent: boolean): number {
-  const missTokens = useContent ? prediction.contentMissTokens : prediction.prefixMissTokens;
-  const readTokens = prediction.totalTokens - missTokens;
-  return readTokens * 0.1 + missTokens * 1.25;
-}
-
+// Measurement-only cache footer. We do NOT predict cache hit — only the detected
+// cache model is shown (it explains why full mode freezes its prefix on
+// prefix-sensitive providers). The real hit lives in the "last turn" header line.
 function cacheImpactLines(): string[] {
-  const off = cachePrediction.off;
-  const safe = cachePrediction.safe;
-  const full = cachePrediction.full;
-  const baselineReady = off.hasBaseline || safe.hasBaseline || full.hasBaseline;
-  const useContent = activeCacheModel === "content";
   const modelLabel = activeCacheModel === "content"
-    ? "content-cache (re-uses blocks after a change)"
+    ? "content-cache (re-uses blocks after a change — full mode prunes freely)"
     : activeCacheModel === "prefix"
-      ? "prefix-cache (change invalidates the tail)"
+      ? "prefix-cache (change invalidates the tail — full mode freezes its prefix)"
       : "unknown cache model (prefix-cache assumed)";
-  const lines: string[] = [`Cache: ${modelLabel}`];
-  if (compactionRebuildPending) {
-    lines.push("  context was just compacted — cache is rebuilding from the summary;");
-    lines.push("  the low last-turn hit reflects that compaction, not a cprune problem.");
-    return lines;
-  }
-  if (!baselineReady) {
-    lines.push("  predicting vs previous turn — run one more turn for cache impact");
-    return lines;
-  }
-  const hitPct = (p: CachePrediction) => (useContent ? p.contentHitPct : p.prefixHitPct);
-  const row = (label: string, p: CachePrediction) =>
-    `  ${label.padEnd(5)} ${hitPct(p).toFixed(1).padStart(5)}% cache hit   change@${p.breakAt < p.totalTokens ? fmtInt(p.breakAt) : "end"}`;
-  lines.push(row("off", off), row("safe", safe), row("full", full));
-
-  // Recommend safe mode when full is cache-hostile on a prefix-sensitive provider.
-  if (mode === "full" && !useContent && full.hasBaseline) {
-    const fullCostIdx = relativeCacheCost(off, false) > 0 ? relativeCacheCost(full, false) / relativeCacheCost(off, false) : 1;
-    if (fullCostIdx >= 1.3) {
-      lines.push(`  ⚠ full mode breaks the cache here (×${fullCostIdx.toFixed(2)} cost) — consider /cprune safe`);
-    }
-  }
-  return lines;
+  return [`Cache model: ${modelLabel}`];
 }
 
 function contextStatText(ctx: any): string {
-  // Refresh the cache prediction from the current context against the (possibly
-  // restored) baseline without committing it, so `/cprune` after a reload — or
-  // any bare invocation without a fresh turn — still shows a comparison.
-  try { refreshCachePrediction(currentContextMessages(ctx), false); } catch { /* ignore */ }
   const off = simulatePrunedContext(ctx, "off");
   const safe = simulatePrunedContext(ctx, "safe");
   const full = simulatePrunedContext(ctx, "full");
@@ -2465,9 +2300,6 @@ export default function cprune(pi: ExtensionAPI) {
     // reset it on start so the freeze re-establishes cleanly from this turn.
     committedPrefixCount = 0;
     committedPrefixForms = [];
-    compactionRebuildPending = false;
-    // cacheBaseline is restored by loadStateFromSession, so the cache prediction
-    // continues across reloads instead of going blank.
     ctx.ui.setStatus("cprune", `cprune: ${mode}`);
   });
 
@@ -2571,7 +2403,6 @@ export default function cprune(pi: ExtensionAPI) {
   });
 
   pi.on("context", (event) => {
-    trackCacheFingerprints(event.messages);
     if (mode === "off") return;
     return { messages: contextHookPrune(event.messages, mode) };
   });

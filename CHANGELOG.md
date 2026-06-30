@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.3.0 - 2026-06-30
+
+### Changed — prediction removed, measurement only
+
+**cprune no longer predicts cache hit.** Earlier versions built an offline fingerprint model to *predict* per-mode cache hit, but it failed every stress test: it went blank on reload (v0.2.16), showed 98% right after a compaction where the real hit was 2% (v0.2.17), and predicted 0% / fired a scary `consider /cprune safe` warning on gpt-5.5 while the real measured hit was 98.2%. A predictor that's confidently wrong is worse than no predictor, so it's gone.
+
+What `/cprune` shows now:
+- **`last turn: X% cache hit · N tok new · $cost`** — the REAL measured hit from the provider's `usage.cacheRead`, nothing predicted.
+- **off / safe / full token bars + per-category breakdown** — deterministic char/token math, no prediction.
+- **`est. saved this turn` / `session`** — now anchored to the deterministic off-vs-active token delta (same math as the bars), priced at the real input rate.
+- **`Cache model: prefix-cache | content-cache`** — just the detected model (explains why full mode freezes its prefix on prefix-sensitive providers). No hit %, no warnings.
+
+Removed: `fingerprintsFor`, `cacheModel`, the per-mode prediction state, the compaction-rebuild flag, the reload-baseline persistence, the `relativeCacheCost` model, and the `⚠ consider safe` warning. ~170 lines deleted.
+
+Kept (and unchanged): the cache-aware **prefix freeze** on prefix-sensitive providers — that's a *protective action*, not a prediction, and it still does its job.
+
 ## v0.2.17 - 2026-06-30
 
 ### Fixed
