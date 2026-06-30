@@ -166,15 +166,22 @@ let mode: CpruneMode = "full";
 let cpruneCompactionRequest: { reason: string; requestedAt: number } | undefined;
 
 // --- Cache-impact tracking (Tier 1: offline prefix model, Tier 2: real usage) ---
-// The prompt cache is a prefix match between consecutive turns. By fingerprinting
-// each message per mode every turn we can predict, without any LLM call, how much
-// of the prompt would be a cache hit (cheap) vs a miss (expensive) for off/safe/full.
+// Providers cache prompts differently. OpenAI/gpt and Anthropic block-cache are
+// prefix-sensitive: retroactively changing an old message invalidates the cached
+// tail. Some gateways (e.g. zai/glm) cache by content/block and re-serve unchanged
+// messages even after a prefix break. We fingerprint each message per mode every
+// turn to predict cache hit without any LLM call, and pick the model that matches
+// the active provider.
 type FingerprintSet = { fps: string[]; sizes: number[] };
+type CacheModel = "prefix" | "content" | "auto";
 type CachePrediction = {
-  readTokens: number;
-  missTokens: number;
+  // Worst case: strict prefix only (OpenAI/gpt-style). prefix break = lose the tail.
+  prefixHitPct: number;
+  prefixMissTokens: number;
+  // Best case: content/block reuse (glm-style). unchanged messages after the break re-serve.
+  contentHitPct: number;
+  contentMissTokens: number;
   totalTokens: number;
-  hitPct: number;
   breakAt: number;
   hasBaseline: boolean;
 };
@@ -187,8 +194,23 @@ type ActualUsage = {
   cost: number;
   hitPct: number;
   model?: string;
+  api?: string;
+  provider?: string;
 };
-const emptyPrediction = (): CachePrediction => ({ readTokens: 0, missTokens: 0, totalTokens: 0, hitPct: 0, breakAt: 0, hasBaseline: false });
+const emptyPrediction = (): CachePrediction => ({ prefixHitPct: 0, prefixMissTokens: 0, contentHitPct: 0, contentMissTokens: 0, totalTokens: 0, breakAt: 0, hasBaseline: false });
+function detectCacheModel(api: unknown, provider: unknown): CacheModel {
+  const a = String(api ?? "").toLowerCase();
+  const p = String(provider ?? "").toLowerCase();
+  // Prefix-sensitive caching: OpenAI family + Anthropic block cache + OpenAI-compatible routers.
+  if (a.includes("openai") || a.includes("codex")) return "prefix";
+  if (a.includes("anthropic") || p === "anthropic" || p.includes("bedrock")) return "prefix";
+  if (a.includes("google") || p.includes("google")) return "prefix";
+  if (["deepseek", "groq", "cerebras", "together", "fireworks", "xai", "github-copilot", "mistral", "moonshotai", "openrouter"].includes(p)) return "prefix";
+  // Content/block reuse empirically observed on zai (glm) gateways.
+  if (p.includes("zai")) return "content";
+  return "auto";
+}
+let activeCacheModel: CacheModel = "auto";
 let cacheBaseline: { off: FingerprintSet; safe: FingerprintSet; full: FingerprintSet } | undefined;
 let cachePrediction: { off: CachePrediction; safe: CachePrediction; full: CachePrediction } = {
   off: emptyPrediction(),
@@ -1747,22 +1769,20 @@ function cacheModel(prev: FingerprintSet | undefined, curr: FingerprintSet): Cac
   const totalChars = curr.sizes.reduce((sum, size) => sum + size, 0);
   const totalTokens = Math.ceil(totalChars / 4);
   if (!prev || prev.fps.length === 0) {
-    return { readTokens: 0, missTokens: totalTokens, totalTokens, hitPct: 0, breakAt: 0, hasBaseline: false };
+    return { prefixHitPct: 0, prefixMissTokens: totalTokens, contentHitPct: 0, contentMissTokens: totalTokens, totalTokens, breakAt: 0, hasBaseline: false };
   }
   const n = Math.min(prev.fps.length, curr.fps.length);
-  // 1) Strict prefix: walk until the first divergence. Everything up to here is
-  //    a definite cache read on any provider.
+  // 1) Strict prefix: walk until the first divergence. Up to here is a definite
+  //    cache read on ANY provider (prefix-sensitive or content-based).
   let prefixChars = 0;
   let breakAt = n;
   for (let i = 0; i < n; i++) {
     if (prev.fps[i] !== curr.fps[i]) { breakAt = i; break; }
     prefixChars += curr.sizes[i];
   }
-  // 2) Content reuse after the break: providers that cache by content/block
-  //    (OpenAI, glm gateways, etc.) re-serve unchanged messages even after the
-  //    strict prefix breaks. Only genuinely changed or brand-new content misses.
-  //    Build a multiset of prev fingerprints, subtract the prefix-consumed ones,
-  //    then match the tail by content.
+  // 2) Content reuse after the break: some providers (glm gateways, etc.) re-serve
+  //    unchanged messages even after the strict prefix breaks. Count remaining
+  //    prev fingerprints (after removing the prefix-consumed ones) and match.
   const available = new Map<string, number>();
   for (const fp of prev.fps) available.set(fp, (available.get(fp) ?? 0) + 1);
   for (let i = 0; i < breakAt; i++) {
@@ -1778,10 +1798,17 @@ function cacheModel(prev: FingerprintSet | undefined, curr: FingerprintSet): Cac
       reuseChars += curr.sizes[i];
     }
   }
-  const readTokens = Math.ceil((prefixChars + reuseChars) / 4);
-  const missTokens = Math.max(0, totalTokens - readTokens);
-  const hitPct = totalTokens > 0 ? (readTokens / totalTokens) * 100 : 0;
-  return { readTokens, missTokens, totalTokens, hitPct, breakAt, hasBaseline: true };
+  const prefixReadTokens = Math.ceil(prefixChars / 4);
+  const contentReadTokens = Math.ceil((prefixChars + reuseChars) / 4);
+  return {
+    prefixHitPct: totalTokens > 0 ? (prefixReadTokens / totalTokens) * 100 : 0,
+    prefixMissTokens: Math.max(0, totalTokens - prefixReadTokens),
+    contentHitPct: totalTokens > 0 ? (contentReadTokens / totalTokens) * 100 : 0,
+    contentMissTokens: Math.max(0, totalTokens - contentReadTokens),
+    totalTokens,
+    breakAt,
+    hasBaseline: true,
+  };
 }
 
 function trackCacheFingerprints(raw: AnyMessage[]): void {
@@ -1810,6 +1837,8 @@ function recordActualUsage(messages: AnyMessage[]): void {
     const input = Number(usage.input ?? 0);
     const cacheWrite = Number(usage.cacheWrite ?? 0);
     const denom = cacheRead + input + cacheWrite;
+    const api = typeof message.api === "string" ? message.api : undefined;
+    const provider = typeof message.provider === "string" ? message.provider : undefined;
     lastActualUsage = {
       input,
       output: Number(usage.output ?? 0),
@@ -1819,15 +1848,21 @@ function recordActualUsage(messages: AnyMessage[]): void {
       cost: Number(usage.cost?.total ?? 0),
       hitPct: denom > 0 ? (cacheRead / denom) * 100 : 0,
       model: typeof message.model === "string" ? message.model : undefined,
+      api,
+      provider,
     };
+    activeCacheModel = detectCacheModel(api, provider);
     return;
   }
 }
 
 // Relative cost index for a prediction, using the typical provider economics:
 // cached reads ~0.1x, cache writes / uncached input ~1.25x (Anthropic cache write premium).
-function relativeCacheCost(prediction: CachePrediction): number {
-  return prediction.readTokens * 0.1 + prediction.missTokens * 1.25;
+// `useContent` picks which hit/miss field to price (provider-dependent).
+function relativeCacheCost(prediction: CachePrediction, useContent: boolean): number {
+  const missTokens = useContent ? prediction.contentMissTokens : prediction.prefixMissTokens;
+  const readTokens = prediction.totalTokens - missTokens;
+  return readTokens * 0.1 + missTokens * 1.25;
 }
 
 function cacheImpactLines(): string[] {
@@ -1835,25 +1870,42 @@ function cacheImpactLines(): string[] {
   const safe = cachePrediction.safe;
   const full = cachePrediction.full;
   const baselineReady = off.hasBaseline || safe.hasBaseline || full.hasBaseline;
-  const lines: string[] = ["", "Cache impact (predicted vs previous turn, content-aware, no extra LLM calls)"];
+  // Which cache model to headline. "auto" = provider unknown yet → be conservative (prefix).
+  const useContent = activeCacheModel === "content";
+  const modelLabel = activeCacheModel === "content"
+    ? "content/block reuse (zai/glm-style)"
+    : activeCacheModel === "prefix"
+      ? "strict prefix (openai/anthropic-style)"
+      : "unknown provider → strict prefix (conservative)";
+  const lines: string[] = [``, `Cache impact (predicted vs previous turn; ${modelLabel}; no extra LLM calls)`];
   if (!baselineReady) {
     lines.push("  collecting baseline — run one more turn to compare cache hits");
     return lines;
   }
-  const offCost = relativeCacheCost(off);
+  const hitPct = (p: CachePrediction) => (useContent ? p.contentHitPct : p.prefixHitPct);
+  const miss = (p: CachePrediction) => (useContent ? p.contentMissTokens : p.prefixMissTokens);
+  const offCost = relativeCacheCost(off, useContent);
   const row = (label: string, p: CachePrediction) => {
-    const extraMiss = Math.max(0, p.missTokens - (off.hasBaseline ? off.missTokens : 0));
+    const extraMiss = Math.max(0, miss(p) - (off.hasBaseline ? miss(off) : 0));
     const breakNote = p.hasBaseline && p.breakAt < p.totalTokens ? ` first-change@${fmtInt(p.breakAt)}` : "";
-    const costIdx = offCost > 0 ? relativeCacheCost(p) / offCost : 1;
-    return `  ${label.padEnd(5)} read ${p.hitPct.toFixed(0).padStart(3)}%  miss ~${fmtInt(p.missTokens)} tok  vs-off +${fmtInt(extraMiss)}${breakNote}  cost×${costIdx.toFixed(2)}`;
+    const costIdx = offCost > 0 ? relativeCacheCost(p, useContent) / offCost : 1;
+    const tail = useContent ? "" : `  (content-cache providers may do better — compare to actual below)`;
+    return `  ${label.padEnd(5)} read ${hitPct(p).toFixed(0).padStart(3)}%  miss ~${fmtInt(miss(p))} tok  vs-off +${fmtInt(extraMiss)}${breakNote}  cost×${costIdx.toFixed(2)}${tail}`;
   };
   lines.push(row("off", off), row("safe", safe), row("full", full));
-  lines.push("  (read% includes content reuse after the prefix break; providers cache by block/content, not strict prefix)");
+
+  // Recommendation: full mode is cache-hostile on prefix-sensitive providers.
+  if (mode === "full" && !useContent && full.hasBaseline) {
+    const fullCostIdx = offCost > 0 ? relativeCacheCost(full, useContent) / offCost : 1;
+    if (fullCostIdx >= 1.3) {
+      lines.push(`  ⚠ full mode costs ×${fullCostIdx.toFixed(2)} of off on prefix-cache providers here — consider /cprune safe`);
+    }
+  }
 
   const actual = lastActualUsage;
   if (actual && actual.totalTokens > 0) {
     const denom = actual.cacheRead + actual.input + actual.cacheWrite;
-    lines.push("", `Last response (actual, ${actual.model ?? "model"}): cache-read ${actual.hitPct.toFixed(0)}%, in ${fmtInt(actual.input)}/write ${fmtInt(actual.cacheWrite)}/read ${fmtInt(actual.cacheRead)} tok${denom > 0 ? "" : " (no cache stats)"}, out ${fmtInt(actual.output)} tok${actual.cost > 0 ? `, cost $${actual.cost.toFixed(4)}` : ""}`);
+    lines.push("", `Last response (actual, ${actual.model ?? "model"}${actual.provider ? ` via ${actual.provider}` : ""}): cache-read ${actual.hitPct.toFixed(0)}%, in ${fmtInt(actual.input)}/write ${fmtInt(actual.cacheWrite)}/read ${fmtInt(actual.cacheRead)} tok${denom > 0 ? "" : " (no cache stats)"}, out ${fmtInt(actual.output)} tok${actual.cost > 0 ? `, cost $${actual.cost.toFixed(4)}` : ""}`);
   }
   return lines;
 }

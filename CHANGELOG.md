@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.6 - 2026-06-30
+
+### Fixed
+- **Provider-aware cache prediction.** v0.2.5 assumed all providers cache by content/block reuse, which made the predictor dangerously optimistic on OpenAI/gpt and Anthropic (they cache by strict prefix). Measured reality confirmed this: the same `full`-mode prefix break produced a **98%** cache hit on a zai/glm gateway but only **8%** on gpt-5.5 (~5× cost). The predictor now detects the provider's cache model from the response's `api`/`provider` and headlines the matching model:
+  - OpenAI/codex/anthropic/bedrock/google and OpenAI-compatible routers (deepseek, groq, xai, mistral, …) → strict-prefix model.
+  - zai/glm gateways → content/block-reuse model.
+  - unknown → conservative strict-prefix, with a hint to compare against the actual reading.
+- Added an inline recommendation: when `full` mode costs ≥1.3× of `off` on a prefix-sensitive provider, `/cprune` suggests `/cprune safe`.
+- Actual usage line now shows the provider slug.
+
 ## v0.2.5 - 2026-06-30
 
 ### Fixed
