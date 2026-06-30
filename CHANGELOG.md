@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.14 - 2026-06-30
+
+### Changed
+- Cache hit is now shown with one decimal place (predicted and actual) so a near-perfect cache reads as e.g. `99.7%` rather than a misleading `100%`. The actual last-turn line also surfaces the uncached `new` token count, making it clear there is always a small new tail that misses.
+
 ## v0.2.13 - 2026-06-30
 
 ### Changed

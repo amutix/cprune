@@ -1999,7 +1999,7 @@ function cacheImpactLines(): string[] {
   }
   const hitPct = (p: CachePrediction) => (useContent ? p.contentHitPct : p.prefixHitPct);
   const row = (label: string, p: CachePrediction) =>
-    `  ${label.padEnd(5)} ${hitPct(p).toFixed(0).padStart(3)}% cache hit   change@${p.breakAt < p.totalTokens ? fmtInt(p.breakAt) : "end"}`;
+    `  ${label.padEnd(5)} ${hitPct(p).toFixed(1).padStart(5)}% cache hit   change@${p.breakAt < p.totalTokens ? fmtInt(p.breakAt) : "end"}`;
   lines.push(row("off", off), row("safe", safe), row("full", full));
 
   // Recommend safe mode when full is cache-hostile on a prefix-sensitive provider.
@@ -2034,7 +2034,8 @@ function contextStatText(ctx: any): string {
 
   const lastTurnBits: string[] = [];
   if (actual && actual.totalTokens > 0) {
-    lastTurnBits.push(`${actual.hitPct.toFixed(0)}% cache hit`);
+    lastTurnBits.push(`${actual.hitPct.toFixed(1)}% cache hit`);
+    if (actual.input > 0) lastTurnBits.push(`${fmtInt(actual.input)} tok new`);
     if (actual.cost > 0) lastTurnBits.push(fmtMoney(actual.cost));
   }
   if (lastTurnBits.length) out.push(`  last turn: ${lastTurnBits.join("  ·  ")}`);
