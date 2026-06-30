@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.7 - 2026-06-30
+
+### Added
+- **Cache-aware full mode.** full mode now **freezes the committed prefix**: once a message's pruned form is sent to the model, that form is locked, so the prompt prefix stays byte-identical across turns and prompt caching is preserved on prefix-sensitive providers (OpenAI/gpt, Anthropic). Only the new (uncommitted) tail is pruned each turn.
+  - Measured motivation: on gpt-5.5, aggressive full mode broke the cache every turn (7–8% cache hit, ~$0.48–0.63/turn for ~120k re-billed input tokens). With prefix freezing, the prefix never retroactively changes, so the cache reads the whole stable prefix and only the genuinely new tail misses.
+  - Within-turn savings are preserved (dedup/truncation of tool results that arrive in the same turn, before first send); cross-turn retrospective supersession is disabled for already-sent messages because that was the source of the cache breaks.
+  - Content-cache providers (zai/glm gateways) are unaffected and keep aggressive full mode (no cache penalty there).
+  - Resets the frozen prefix after compaction (history shrink) and on session start.
+
 ## v0.2.6 - 2026-06-30
 
 ### Fixed

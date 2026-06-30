@@ -45,6 +45,12 @@ cprune has three operating modes:
 - **safe**: conservative mode. Persist-time pruning still handles mechanical duplicate/append/oversized tool results, and prompt-time pruning applies low-risk mechanical rules plus user-approved exclusions. It avoids semantic/latest-wins rules such as stale reads, entity snapshot pruning, old thinking removal, and historical tool-call argument compaction.
 - **full**: aggressive/default legacy behavior. Includes safe rules plus semantic/latest-wins prompt-time pruning, stale reads, entity/tool-result supersession, old thinking removal, and tool-call argument compaction.
 
+### Cache-aware full mode
+
+Prompt caching makes long context cheap when consecutive turns share a byte-identical prefix. full-mode supersession can retroactively rewrite an already-sent message, which on **prefix-sensitive providers** (OpenAI/gpt, Anthropic) invalidates the cached tail and re-bills it every turn — measured at a 7–8% cache hit (~$0.5/turn) on gpt-5.5. To avoid this, full mode **freezes the committed prefix**: once a message's pruned form is sent, that form is locked so the prefix stays identical across turns. Only the new (uncommitted) tail is pruned each turn.
+
+This preserves within-turn savings (dedup/truncation of tool results arriving in the same turn, before their first send) while keeping the cache stable. Cross-turn retrospective supersession is disabled for already-sent messages. **Content-cache providers** (e.g. zai/glm gateways, which re-serve unchanged content after a break) are unaffected and keep fully aggressive full mode, since they pay no cache penalty for retroactive changes. Use `/cprune` to see the per-mode cache impact and the detected cache model for the active provider.
+
 Risk levels:
 
 - Low risk / near-lossless: exact duplicates, normalized duplicates, exact append/prefix repeats, and repeated chunks where a newer full copy remains. cprune preserves failed/error diagnostics, mutation outputs, side-effectful shell commands, and non-repeatable browser/API-style results by default.

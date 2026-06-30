@@ -218,6 +218,12 @@ let cachePrediction: { off: CachePrediction; safe: CachePrediction; full: CacheP
   full: emptyPrediction(),
 };
 let lastActualUsage: ActualUsage | undefined;
+// Cache-aware prefix freezing (see contextHookPrune). Once a message's pruned
+// form is sent to the model, that form is frozen so the prompt prefix stays
+// byte-identical across turns — preserving prompt caching on prefix-sensitive
+// providers (OpenAI/gpt, Anthropic). Only the new (uncommitted) tail is pruned.
+let committedPrefixCount = 0;
+let committedPrefixForms: AnyMessage[] = [];
 
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex");
@@ -1715,7 +1721,9 @@ function simulatePrunedContext(ctx: any, pruneMode: CpruneMode) {
   const before = contextSize(rawMessages);
 
   const snapshot = cloneStats();
-  const prunedMessages = pruneContextMessages(rawMessages, pruneMode);
+  const prunedMessages = pruneMode === "full"
+    ? frozenResultFor(rawMessages, pruneContextMessages(rawMessages, "full"))
+    : pruneContextMessages(rawMessages, pruneMode);
   const passDelta = {
     staleReads: stats.contextStaleReads - snapshot.contextStaleReads,
     duplicates: stats.contextDuplicates - snapshot.contextDuplicates,
@@ -1811,11 +1819,39 @@ function cacheModel(prev: FingerprintSet | undefined, curr: FingerprintSet): Cac
   };
 }
 
+function frozenResultFor(rawMessages: AnyMessage[], aggressive: AnyMessage[]): AnyMessage[] {
+  // No freezing on content-cache providers (no cache penalty there) or before
+  // anything is committed. If history shrank (e.g. after compaction) the committed
+  // indices no longer align, so fall back to aggressive and let the hook reset.
+  if (activeCacheModel === "content") return aggressive;
+  if (committedPrefixCount === 0) return aggressive;
+  if (committedPrefixCount > rawMessages.length) return aggressive;
+  const result = aggressive.slice();
+  for (let i = 0; i < committedPrefixCount && i < result.length; i++) result[i] = committedPrefixForms[i];
+  return result;
+}
+
+// The real context hook path. Computes aggressive full pruning, then freezes the
+// already-committed prefix (so the cache prefix never breaks) and prunes only the
+// new tail. Commits this turn's frozen forms for next turn.
+function contextHookPrune(rawMessages: AnyMessage[], pruneMode: CpruneMode): AnyMessage[] {
+  const aggressive = pruneContextMessages(rawMessages, pruneMode);
+  if (pruneMode !== "full" || activeCacheModel === "content") return aggressive;
+  if (committedPrefixCount > rawMessages.length) {
+    committedPrefixCount = 0;
+    committedPrefixForms = [];
+  }
+  const result = frozenResultFor(rawMessages, aggressive);
+  committedPrefixCount = result.length;
+  committedPrefixForms = result.slice();
+  return result;
+}
+
 function trackCacheFingerprints(raw: AnyMessage[]): void {
   const offFp = fingerprintsFor(raw);
   const snapshot = cloneStats();
   const safePruned = pruneContextMessages(raw, "safe");
-  const fullPruned = pruneContextMessages(raw, "full");
+  const fullPruned = frozenResultFor(raw, pruneContextMessages(raw, "full"));
   restoreStats(snapshot);
   const safeFp = fingerprintsFor(safePruned);
   const fullFp = fingerprintsFor(fullPruned);
@@ -2287,6 +2323,9 @@ function maybeTriggerCompaction(ctx: any) {
 export default function cprune(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     loadStateFromSession(ctx);
+    committedPrefixCount = 0;
+    committedPrefixForms = [];
+    cacheBaseline = undefined;
     ctx.ui.setStatus("cprune", `cprune: ${mode}`);
   });
 
@@ -2392,7 +2431,7 @@ export default function cprune(pi: ExtensionAPI) {
   pi.on("context", (event) => {
     trackCacheFingerprints(event.messages);
     if (mode === "off") return;
-    return { messages: pruneContextMessages(event.messages, mode) };
+    return { messages: contextHookPrune(event.messages, mode) };
   });
 
   pi.on("agent_end", (event, ctx) => {
