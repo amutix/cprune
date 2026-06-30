@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.12 - 2026-06-30
+
+### Added
+- **"Measured cache impact" section** in the README documenting the real before/after result: on gpt-5.5 (prefix-cache), cache hit went from 7–8% → 100% and per-turn cost from ~$0.50 → ~$0.09 once the cache-aware prefix-freeze is active; on glm/zai (content-cache) it stays ~99% with full aggression.
+
+### Fixed
+- Marked v0.2.4–v0.2.6 as pre-release. Those versions ship the older cache-breaking full-mode behavior (retrospective supersession that invalidated the prefix cache on OpenAI/gpt and Anthropic). Use v0.2.12 (cache-aware freeze) or later.
+
 ## v0.2.11 - 2026-06-30
 
 ### Fixed
