@@ -1731,7 +1731,7 @@ function simulatePrunedContext(ctx: any, pruneMode: CpruneMode) {
 
   const snapshot = cloneStats();
   const prunedMessages = pruneMode === "full"
-    ? frozenResultFor(rawMessages, pruneContextMessages(rawMessages, "full"))
+    ? pruneFullWithSafeFloor(rawMessages)
     : pruneContextMessages(rawMessages, pruneMode);
   const passDelta = {
     staleReads: stats.contextStaleReads - snapshot.contextStaleReads,
@@ -1775,6 +1775,24 @@ function simulatePrunedContext(ctx: any, pruneMode: CpruneMode) {
   };
 }
 
+function pruneFullWithSafeFloor(rawMessages: AnyMessage[]): AnyMessage[] {
+  // Full mode is conceptually "safe plus more". Some semantic full-mode
+  // replacements can be longer than a safe mechanical duplicate/append
+  // replacement for the same message. Prefer the smaller safe replacement on a
+  // per-message basis so full never saves less than safe because of rule order.
+  const snapshot = cloneStats();
+  const safe = pruneContextMessages(rawMessages, "safe");
+  restoreStats(snapshot);
+
+  const full = pruneContextMessages(rawMessages, "full");
+  if (safe.length !== full.length) return full;
+
+  return full.map((message, index) => {
+    const safeMessage = safe[index];
+    return roughMessageChars(safeMessage) < roughMessageChars(message) ? safeMessage : message;
+  });
+}
+
 function frozenResultFor(rawMessages: AnyMessage[], aggressive: AnyMessage[]): AnyMessage[] {
   // No freezing on content-cache providers (no cache penalty there) or before
   // anything is committed. If history shrank (e.g. after compaction) the committed
@@ -1800,7 +1818,7 @@ function frozenResultFor(rawMessages: AnyMessage[], aggressive: AnyMessage[]): A
 // already-committed prefix (so the cache prefix never breaks) and prunes only the
 // new tail. Commits this turn's frozen forms for next turn.
 function contextHookPrune(rawMessages: AnyMessage[], pruneMode: CpruneMode): AnyMessage[] {
-  const aggressive = pruneContextMessages(rawMessages, pruneMode);
+  const aggressive = pruneMode === "full" ? pruneFullWithSafeFloor(rawMessages) : pruneContextMessages(rawMessages, pruneMode);
   if (pruneMode !== "full" || activeCacheModel === "content") return aggressive;
   if (committedPrefixCount > rawMessages.length) {
     committedPrefixCount = 0;
@@ -1892,7 +1910,11 @@ function cacheImpactLines(): string[] {
     : activeCacheModel === "prefix"
       ? "prefix-cache (change invalidates the tail — full mode freezes its prefix)"
       : "unknown cache model (prefix-cache assumed)";
-  return [`Cache model: ${modelLabel}`];
+  const lines = [`Cache model: ${modelLabel}`];
+  if (mode === "full" && activeCacheModel === "prefix" && committedPrefixCount > 0) {
+    lines.push("  note: off/safe/full rows show fresh pruning potential; active full keeps the old prefix frozen for cache stability.");
+  }
+  return lines;
 }
 
 function contextStatText(ctx: any): string {

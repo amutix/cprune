@@ -38,10 +38,11 @@ cprune
 Interpretation:
 
 - `off` is the raw prompt size with no cprune prompt-time pruning.
-- `safe` is conservative pruning.
-- `full` is aggressive pruning.
+- `safe` is fresh conservative pruning potential.
+- `full` is fresh aggressive pruning potential (`full` is kept at least as small as `safe` per message).
 - `last turn` is the **actual provider-reported cache behavior** from the previous model call.
-- `est. saved` is calculated from the exact prompt-token delta captured before the model call, priced with real billing data when available or clearly labeled assumed pricing otherwise.
+- `est. saved this turn` is the actual prompt-token delta captured before the model call, priced with real billing data when available or clearly labeled assumed pricing otherwise.
+- On prefix-cache providers, active `full` may keep an old prefix frozen for cache stability; `/cprune` notes this when relevant.
 
 ## Install
 
@@ -130,7 +131,7 @@ Prompt caching can make long sessions cheap when consecutive requests share a st
 
 cprune handles this carefully:
 
-- On **prefix-cache providers** such as OpenAI/gpt and Anthropic-style APIs, `full` mode freezes the already-sent prefix. Only the new tail is aggressively pruned. This preserves prompt-cache stability.
+- On **prefix-cache providers** such as OpenAI/gpt and Anthropic-style APIs, active `full` mode freezes the already-sent prefix. Only the new tail is aggressively pruned. This preserves prompt-cache stability.
 - On **content-cache providers** such as zai/glm gateways, `full` mode stays fully aggressive because those providers can reuse unchanged blocks even after a prefix change.
 
 `/cprune` does **not** predict cache hit rates. Prediction turned out to be less reliable than the APIs themselves. Instead, cprune reports the real last-turn cache hit from provider usage data.

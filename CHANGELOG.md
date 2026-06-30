@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.2 - 2026-06-30
+
+### Fixed
+- `/cprune` no longer compares unfrozen `safe` against cache-frozen `full`. The off/safe/full rows now show fresh pruning potential consistently, while `est. saved this turn` remains the actual prompt delta captured before the last model call.
+- Full mode now has a safe-floor invariant: when a safe mechanical replacement is smaller than a full semantic replacement for the same message, full uses the smaller safe replacement. This prevents cases where fresh full pruning appears to save less than safe due to rule ordering or longer semantic placeholders.
+- Added a short `/cprune` note on prefix-cache providers explaining that active full mode keeps the already-sent prefix frozen for cache stability.
+
 ## v0.3.1 - 2026-06-30
 
 ### Stabilization / hardening
