@@ -1696,7 +1696,12 @@ function approxTokensFromChars(chars: number): number {
   return Math.ceil(chars / 4);
 }
 
-function triBreakdownLines(off: Breakdown, safe: Breakdown, full: Breakdown): string[] {
+function triBreakdownLines(
+  off: Breakdown,
+  safe: Breakdown,
+  full: Breakdown,
+  totals: { off: number; safe: number; full: number },
+): string[] {
   const labels = [
     "tool results",
     "assistant thinking",
@@ -1717,7 +1722,7 @@ function triBreakdownLines(off: Breakdown, safe: Breakdown, full: Breakdown): st
   );
   const max = Math.max(1, ...ordered.map((label) => Math.max(off[label] ?? 0, safe[label] ?? 0, full[label] ?? 0)));
 
-  return ordered.flatMap((label) => {
+  const lines = ordered.flatMap((label) => {
     const o = off[label] ?? 0;
     const s = safe[label] ?? 0;
     const f = full[label] ?? 0;
@@ -1730,6 +1735,16 @@ function triBreakdownLines(off: Breakdown, safe: Breakdown, full: Breakdown): st
       `  ${"".padEnd(20)} ${colorBar(f, max, "full", 12)} ${fmtInt(fTok).padStart(9)} tok  full saved ${fmtInt(Math.max(0, oTok - fTok))}`,
     ];
   });
+
+  const offTok = approxTokensFromChars(totals.off);
+  const safeTok = approxTokensFromChars(totals.safe);
+  const fullTok = approxTokensFromChars(totals.full);
+  lines.push(
+    `  ${"total".padEnd(20)} ${colorBar(totals.off, Math.max(1, totals.off), "off", 12)} ${fmtInt(offTok).padStart(9)} tok  off`,
+    `  ${"".padEnd(20)} ${colorBar(totals.safe, Math.max(1, totals.off), "safe", 12)} ${fmtInt(safeTok).padStart(9)} tok  safe saved ${fmtInt(Math.max(0, offTok - safeTok))}`,
+    `  ${"".padEnd(20)} ${colorBar(totals.full, Math.max(1, totals.off), "full", 12)} ${fmtInt(fullTok).padStart(9)} tok  full saved ${fmtInt(Math.max(0, offTok - fullTok))}`,
+  );
+  return lines;
 }
 
 function simulatePrunedContext(ctx: any, pruneMode: CpruneMode) {
@@ -1968,7 +1983,11 @@ function contextStatText(ctx: any): string {
 
   out.push("");
   out.push("Breakdown by context part, approx tok (off / safe / full)");
-  out.push(...triBreakdownLines(off.beforeBreakdown, safe.afterBreakdown, full.afterBreakdown));
+  out.push(...triBreakdownLines(off.beforeBreakdown, safe.afterBreakdown, full.afterBreakdown, {
+    off: off.before.chars,
+    safe: safe.after.chars,
+    full: full.after.chars,
+  }));
 
   out.push("");
   out.push(...cacheImpactLines());

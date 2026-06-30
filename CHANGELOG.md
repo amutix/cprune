@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.2 - 2026-06-30
+
+### Changed
+- Added a `total` row to the `/cprune` breakdown so the per-part section reconciles directly with the off/safe/full headline totals.
+- The breakdown remains token-only; raw character counts stay internal.
+
 ## v0.4.1 - 2026-06-30
 
 ### Changed
