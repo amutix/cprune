@@ -9,7 +9,7 @@ Entity-aware pruning is generic rather than tied to one extension: it detects ID
 ## Highlights
 
 - Three operating modes: **off**, **safe**, and **full**.
-- `/cprune` shows a compact off/safe/full comparison with red/orange/green bars.
+- `/cprune` shows a compact off/safe/full comparison with red/orange/green bars, plus a cache-impact section that predicts per-mode prompt-cache hit rate vs the previous turn **without extra LLM calls**.
 - Conservative persist-time pruning handles exact/normalized duplicates, append repeats, and oversized tool results, while preserving failed diagnostics, mutation outputs, side-effectful shell commands, and non-repeatable browser/API-style results.
 - Prompt-time pruning removes stale, duplicate, oversized, or explicitly user-excluded context before model calls.
 - `/cprune review` and `/cprune review-prompts` let users explicitly exclude large entries or prompt/response turns without rewriting Pi history.
@@ -18,6 +18,16 @@ Entity-aware pruning is generic rather than tied to one extension: it detects ID
 ## Screenshot
 
 ![cprune off/safe/full context comparison](screenshot.png)
+
+## Cache impact
+
+Prompt caching makes long context cheap when consecutive turns share a stable prefix. Pruning that changes an older message retroactively breaks that prefix, turning cheap cached reads into expensive misses. cprune's `/cprune` comparison now shows this tradeoff explicitly:
+
+- **Predicted cache hit** per mode (off/safe/full) computed offline via prefix-matching the fingerprinted prompt against the previous turn's. No extra model calls are made.
+- **Relative cost index** using provider economics (cached reads ≈ 0.1×, misses/cache-writes ≈ 1.25×), so you can see when `full` mode's token savings are outweighed by cache penalties.
+- **Actual cache stats** read from the live response (`cacheRead`, `cacheWrite`, `input`, `cost`) to validate the prediction.
+
+This makes the cost/benefit of each mode visible in real sessions rather than only theoretical.
 
 ## Safety and information loss
 

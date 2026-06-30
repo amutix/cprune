@@ -165,6 +165,38 @@ let compactInFlight = false;
 let mode: CpruneMode = "full";
 let cpruneCompactionRequest: { reason: string; requestedAt: number } | undefined;
 
+// --- Cache-impact tracking (Tier 1: offline prefix model, Tier 2: real usage) ---
+// The prompt cache is a prefix match between consecutive turns. By fingerprinting
+// each message per mode every turn we can predict, without any LLM call, how much
+// of the prompt would be a cache hit (cheap) vs a miss (expensive) for off/safe/full.
+type FingerprintSet = { fps: string[]; sizes: number[] };
+type CachePrediction = {
+  readTokens: number;
+  missTokens: number;
+  totalTokens: number;
+  hitPct: number;
+  breakAt: number;
+  hasBaseline: boolean;
+};
+type ActualUsage = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  cost: number;
+  hitPct: number;
+  model?: string;
+};
+const emptyPrediction = (): CachePrediction => ({ readTokens: 0, missTokens: 0, totalTokens: 0, hitPct: 0, breakAt: 0, hasBaseline: false });
+let cacheBaseline: { off: FingerprintSet; safe: FingerprintSet; full: FingerprintSet } | undefined;
+let cachePrediction: { off: CachePrediction; safe: CachePrediction; full: CachePrediction } = {
+  off: emptyPrediction(),
+  safe: emptyPrediction(),
+  full: emptyPrediction(),
+};
+let lastActualUsage: ActualUsage | undefined;
+
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
@@ -731,6 +763,10 @@ function loadStateFromSession(ctx: any) {
       if (item?.hash) manualTurnOmissions.set(item.hash, item);
     }
   }
+
+  if (stateEntry.data.lastActualUsage && typeof stateEntry.data.lastActualUsage === "object") {
+    lastActualUsage = stateEntry.data.lastActualUsage;
+  }
 }
 
 function saveState(pi: ExtensionAPI) {
@@ -742,6 +778,7 @@ function saveState(pi: ExtensionAPI) {
     seenOutputs: [...seenOutputs.values()].slice(-config.maxSeenHashes),
     manualOmissions: [...manualOmissions.values()],
     manualTurnOmissions: [...manualTurnOmissions.values()],
+    lastActualUsage,
     savedAt: Date.now(),
   });
 }
@@ -1699,6 +1736,105 @@ function simulatePrunedContext(ctx: any, pruneMode: CpruneMode) {
   };
 }
 
+function fingerprintsFor(messages: AnyMessage[]): FingerprintSet {
+  return {
+    fps: messages.map((message) => shortHash(hashText(safeJson(message, 100_000)))),
+    sizes: messages.map((message) => roughMessageChars(message)),
+  };
+}
+
+function prefixMatch(prev: FingerprintSet | undefined, curr: FingerprintSet): CachePrediction {
+  const totalChars = curr.sizes.reduce((sum, size) => sum + size, 0);
+  const totalTokens = Math.ceil(totalChars / 4);
+  if (!prev || prev.fps.length === 0) {
+    return { readTokens: 0, missTokens: totalTokens, totalTokens, hitPct: 0, breakAt: 0, hasBaseline: false };
+  }
+  const n = Math.min(prev.fps.length, curr.fps.length);
+  let matchedChars = 0;
+  let breakAt = n;
+  for (let i = 0; i < n; i++) {
+    if (prev.fps[i] !== curr.fps[i]) { breakAt = i; break; }
+    matchedChars += curr.sizes[i];
+  }
+  const readTokens = Math.ceil(matchedChars / 4);
+  const missTokens = Math.max(0, totalTokens - readTokens);
+  const hitPct = totalTokens > 0 ? (readTokens / totalTokens) * 100 : 0;
+  return { readTokens, missTokens, totalTokens, hitPct, breakAt, hasBaseline: true };
+}
+
+function trackCacheFingerprints(raw: AnyMessage[]): void {
+  const offFp = fingerprintsFor(raw);
+  const snapshot = cloneStats();
+  const safePruned = pruneContextMessages(raw, "safe");
+  const fullPruned = pruneContextMessages(raw, "full");
+  restoreStats(snapshot);
+  const safeFp = fingerprintsFor(safePruned);
+  const fullFp = fingerprintsFor(fullPruned);
+
+  cachePrediction = {
+    off: prefixMatch(cacheBaseline?.off, offFp),
+    safe: prefixMatch(cacheBaseline?.safe, safeFp),
+    full: prefixMatch(cacheBaseline?.full, fullFp),
+  };
+  cacheBaseline = { off: offFp, safe: safeFp, full: fullFp };
+}
+
+function recordActualUsage(messages: AnyMessage[]): void {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i] as any;
+    const usage = message?.usage;
+    if (message?.role !== "assistant" || !usage) continue;
+    const cacheRead = Number(usage.cacheRead ?? 0);
+    const input = Number(usage.input ?? 0);
+    const cacheWrite = Number(usage.cacheWrite ?? 0);
+    const denom = cacheRead + input + cacheWrite;
+    lastActualUsage = {
+      input,
+      output: Number(usage.output ?? 0),
+      cacheRead,
+      cacheWrite,
+      totalTokens: Number(usage.totalTokens ?? 0),
+      cost: Number(usage.cost?.total ?? 0),
+      hitPct: denom > 0 ? (cacheRead / denom) * 100 : 0,
+      model: typeof message.model === "string" ? message.model : undefined,
+    };
+    return;
+  }
+}
+
+// Relative cost index for a prediction, using the typical provider economics:
+// cached reads ~0.1x, cache writes / uncached input ~1.25x (Anthropic cache write premium).
+function relativeCacheCost(prediction: CachePrediction): number {
+  return prediction.readTokens * 0.1 + prediction.missTokens * 1.25;
+}
+
+function cacheImpactLines(): string[] {
+  const off = cachePrediction.off;
+  const safe = cachePrediction.safe;
+  const full = cachePrediction.full;
+  const baselineReady = off.hasBaseline || safe.hasBaseline || full.hasBaseline;
+  const lines: string[] = ["", "Cache impact (predicted vs previous turn, no extra LLM calls)"];
+  if (!baselineReady) {
+    lines.push("  collecting baseline — run one more turn to compare cache hits");
+    return lines;
+  }
+  const offCost = relativeCacheCost(off);
+  const row = (label: string, p: CachePrediction) => {
+    const extraMiss = Math.max(0, p.missTokens - (off.hasBaseline ? off.missTokens : 0));
+    const breakNote = p.hasBaseline && p.breakAt < p.totalTokens ? ` break@${fmtInt(p.breakAt)}` : "";
+    const costIdx = offCost > 0 ? relativeCacheCost(p) / offCost : 1;
+    return `  ${label.padEnd(5)} read ${p.hitPct.toFixed(0).padStart(3)}%  miss ~${fmtInt(p.missTokens)} tok  vs-off +${fmtInt(extraMiss)}${breakNote}  cost×${costIdx.toFixed(2)}`;
+  };
+  lines.push(row("off", off), row("safe", safe), row("full", full));
+
+  const actual = lastActualUsage;
+  if (actual && actual.totalTokens > 0) {
+    const denom = actual.cacheRead + actual.input + actual.cacheWrite;
+    lines.push("", `Last response (actual, ${actual.model ?? "model"}): cache-read ${actual.hitPct.toFixed(0)}%, in ${fmtInt(actual.input)}/write ${fmtInt(actual.cacheWrite)}/read ${fmtInt(actual.cacheRead)} tok${denom > 0 ? "" : " (no cache stats)"}, out ${fmtInt(actual.output)} tok${actual.cost > 0 ? `, cost $${actual.cost.toFixed(4)}` : ""}`);
+  }
+  return lines;
+}
+
 function contextStatText(ctx: any): string {
   const off = simulatePrunedContext(ctx, "off");
   const safe = simulatePrunedContext(ctx, "safe");
@@ -1730,6 +1866,7 @@ function contextStatText(ctx: any): string {
     "",
     "Breakdown by context part (off / safe / full)",
     ...triBreakdownLines(off.beforeBreakdown, safe.afterBreakdown, full.afterBreakdown),
+    ...cacheImpactLines(),
   ].join("\n");
 }
 
@@ -2178,11 +2315,14 @@ export default function cprune(pi: ExtensionAPI) {
   });
 
   pi.on("context", (event) => {
+    trackCacheFingerprints(event.messages);
     if (mode === "off") return;
     return { messages: pruneContextMessages(event.messages, mode) };
   });
 
-  pi.on("agent_end", (_event, ctx) => {
+  pi.on("agent_end", (event, ctx) => {
+    recordActualUsage(event.messages);
+    saveState(pi);
     maybeTriggerCompaction(ctx);
   });
 

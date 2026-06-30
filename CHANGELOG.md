@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.4 - 2026-06-30
+
+### Added
+- Cache-impact analysis in `/cprune`: predicts per-mode prompt-cache hit rate and relative cost vs the previous turn, with **no extra LLM calls**. Uses an offline prefix-match model (cached reads ~0.1x, misses/cache-writes ~1.25x) to expose the cache penalty of `full` vs `safe` vs `off`.
+- Reads real provider usage from assistant messages (`input`, `cacheRead`, `cacheWrite`, `output`, `cost`) and surfaces actual cache-hit % in the comparison view.
+
 ## v0.2.3 - 2026-06-26
 
 ### Fixed
