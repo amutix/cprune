@@ -71,6 +71,8 @@ pi -e ./src/cprune.ts
 
 cprune also registers an LLM-callable tool named `cprune_status` with actions `safe`, `full`, `off`, and `compact`.
 
+New sessions default to `safe`. Existing sessions keep their persisted mode.
+
 ## Modes
 
 ### `off`
@@ -79,7 +81,7 @@ No future pruning is applied. `/cprune` still simulates `safe` and `full` so you
 
 ### `safe`
 
-Conservative mode. Focuses on mechanical duplication and size reduction:
+Default/recommended mode. Conservative mode focuses on mechanical duplication and size reduction:
 
 - exact duplicate tool results
 - normalized duplicates where only ANSI/CRLF/trailing whitespace differ
@@ -92,7 +94,7 @@ Safe mode avoids semantic/latest-wins rules such as stale reads, entity superses
 
 ### `full`
 
-Aggressive mode. Includes safe-mode rules plus higher-savings prompt-time pruning:
+Aggressive opt-in mode. Includes safe-mode rules plus higher-savings prompt-time pruning:
 
 - stale read-only snapshot pruning (`rg`, `find`, `ls`, `git status`, etc.)
 - superseded custom/entity/tool-result snapshots
@@ -192,8 +194,8 @@ Use cprune if you run long Pi coding sessions with lots of repeated tool output 
 
 Recommended default:
 
-- Start with **`full`** if you want maximum savings and trust cprune's safety guards.
-- Use **`safe`** for conservative production/debugging sessions.
+- Start with **`safe`** for stable day-to-day use.
+- Use **`full`** only when you explicitly want aggressive prompt-time pruning and accept that it rewrites more historical context sent to the model.
 - Use **`off`** when investigating whether pruning affects a specific behavior.
 
 Run `/cprune` any time to see what it is doing.

@@ -178,7 +178,7 @@ const manualOmissions = new Map<string, ManualOmission>();
 const manualTurnOmissions = new Map<string, ManualTurnOmission>();
 let lastCompactAt = 0;
 let compactInFlight = false;
-let mode: CpruneMode = "full";
+let mode: CpruneMode = "safe";
 let cpruneCompactionRequest: { reason: string; requestedAt: number } | undefined;
 
 // --- Cache handling ---
@@ -824,7 +824,7 @@ function loadStateFromSession(ctx: any) {
   stats.entityFamilyPruned = { ...(stateEntry.data.stats?.entityFamilyPruned ?? {}) };
   stats.entityFamilySavedChars = { ...(stateEntry.data.stats?.entityFamilySavedChars ?? {}) };
   lastCompactAt = stateEntry.data.lastCompactAt ?? 0;
-  mode = stateEntry.data.mode ?? (stateEntry.data.enabled === false ? "off" : "full");
+  mode = stateEntry.data.mode ?? (stateEntry.data.enabled === false ? "off" : "safe");
 
   if (Array.isArray(stateEntry.data.seenOutputs)) {
     seenOutputs.clear();

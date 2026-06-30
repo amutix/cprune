@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.0 - 2026-06-30
+
+### Changed
+- New sessions now default to **safe** mode instead of **full**. This makes cprune's stable/default behavior conservative: mechanical duplicate/append/oversize pruning, explicit review exclusions, and low-risk prompt-time cleanup.
+- Existing sessions keep their persisted mode. If a session is already in `full`, it stays in `full` until the user runs `/cprune safe` or `/cprune off`.
+- README now frames `full` as aggressive opt-in rather than the recommended default. Full remains available for users who want maximum prompt-time savings and accept broader historical-context rewrites.
+
 ## v0.3.4 - 2026-06-30
 
 ### Fixed
