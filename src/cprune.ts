@@ -822,9 +822,14 @@ function loadStateFromSession(ctx: any) {
   }
 
   if (stateEntry.data.lastActualUsage && typeof stateEntry.data.lastActualUsage === "object") {
-    lastActualUsage = stateEntry.data.lastActualUsage;
+    const restoredUsage = stateEntry.data.lastActualUsage;
+    lastActualUsage = restoredUsage;
+    // Recompute the provider cache model from the restored usage so `/cprune`
+    // after reload shows the right model instead of "unknown".
+    activeCacheModel = detectCacheModel(restoredUsage.api, restoredUsage.provider);
   }
   cumulativeCostSavedEstimate = Number(stateEntry.data.cumulativeCostSavedEstimate ?? 0);
+  lastTurnCostSavedEstimate = Number(stateEntry.data.lastTurnCostSavedEstimate ?? 0);
   // Restore the cache-prediction baseline so estimates continue across reloads.
   const persisted = stateEntry.data.cacheBaseline;
   if (persisted && typeof persisted === "object"
@@ -846,6 +851,7 @@ function saveState(pi: ExtensionAPI) {
     manualTurnOmissions: [...manualTurnOmissions.values()],
     lastActualUsage,
     cumulativeCostSavedEstimate,
+    lastTurnCostSavedEstimate,
     // Persist the cache-prediction baseline so the off/safe/full cache-hit
     // estimates survive reloads. This is just fingerprints (hashes + sizes),
     // small and serializable. The committed-prefix freeze is NOT persisted
@@ -1892,7 +1898,7 @@ function contextHookPrune(rawMessages: AnyMessage[], pruneMode: CpruneMode): Any
   return result;
 }
 
-function trackCacheFingerprints(raw: AnyMessage[]): void {
+function refreshCachePrediction(raw: AnyMessage[], commit: boolean): void {
   const offFp = fingerprintsFor(raw);
   const snapshot = cloneStats();
   const safePruned = pruneContextMessages(raw, "safe");
@@ -1906,12 +1912,19 @@ function trackCacheFingerprints(raw: AnyMessage[]): void {
     safe: cacheModel(cacheBaseline?.safe, safeFp),
     full: cacheModel(cacheBaseline?.full, fullFp),
   };
-  cacheBaseline = { off: offFp, safe: safeFp, full: fullFp };
   lastFootprintTokens = {
     off: Math.ceil(offFp.sizes.reduce((s, n) => s + n, 0) / 4),
     safe: Math.ceil(safeFp.sizes.reduce((s, n) => s + n, 0) / 4),
     full: Math.ceil(fullFp.sizes.reduce((s, n) => s + n, 0) / 4),
   };
+  // Only the live context hook advances the baseline; display/load refreshes use
+  // the restored baseline without committing, so a bare `/cprune` after reload
+  // still compares against the previous turn.
+  if (commit) cacheBaseline = { off: offFp, safe: safeFp, full: fullFp };
+}
+
+function trackCacheFingerprints(raw: AnyMessage[]): void {
+  refreshCachePrediction(raw, true);
 }
 
 function recordActualUsage(messages: AnyMessage[]): void {
@@ -2027,6 +2040,10 @@ function cacheImpactLines(): string[] {
 }
 
 function contextStatText(ctx: any): string {
+  // Refresh the cache prediction from the current context against the (possibly
+  // restored) baseline without committing it, so `/cprune` after a reload — or
+  // any bare invocation without a fresh turn — still shows a comparison.
+  try { refreshCachePrediction(currentContextMessages(ctx), false); } catch { /* ignore */ }
   const off = simulatePrunedContext(ctx, "off");
   const safe = simulatePrunedContext(ctx, "safe");
   const full = simulatePrunedContext(ctx, "full");

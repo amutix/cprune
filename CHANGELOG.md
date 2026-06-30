@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.16 - 2026-06-30
+
+### Fixed
+- **Stats no longer blank after a bare reload.** Three reload gaps closed:
+  - The cache-prediction section (off/safe/full hit %, change@N) is now recomputed from the current context against the restored baseline whenever `/cprune` runs — previously it went blank ("run one more turn") until a new turn fired.
+  - The provider cache model is recomputed from the restored last usage, so it shows the correct `prefix-cache` / `content-cache` instead of `unknown` after reload.
+  - `est. saved this turn` now persists across reload (it reset to `$0.00`).
+
 ## v0.2.15 - 2026-06-30
 
 ### Fixed
