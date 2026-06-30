@@ -1696,39 +1696,75 @@ function approxTokensFromChars(chars: number): number {
   return Math.ceil(chars / 4);
 }
 
+const BREAKDOWN_LABELS = [
+  "tool results",
+  "assistant thinking",
+  "assistant text",
+  "tool calls",
+  "custom messages",
+  "user messages",
+  "summaries",
+  "bash executions",
+  "assistant other",
+  "other",
+];
+
+function orderedBreakdownLabels(...breakdowns: Breakdown[]): string[] {
+  const dynamic = [...new Set(breakdowns.flatMap((breakdown) => Object.keys(breakdown)))]
+    .filter((label) => !BREAKDOWN_LABELS.includes(label))
+    .sort();
+  return [...BREAKDOWN_LABELS, ...dynamic].filter((label) => breakdowns.some((breakdown) => (breakdown[label] ?? 0) > 0));
+}
+
+function allocateApproxTokensByLabel(breakdown: Breakdown, labels: string[], totalTokens: number): Record<string, number> {
+  const rows = labels.map((label, index) => {
+    const chars = breakdown[label] ?? 0;
+    const exact = chars / 4;
+    const base = Math.floor(exact);
+    return { label, chars, tokens: base, fraction: exact - base, index };
+  });
+
+  let remaining = Math.max(0, totalTokens - rows.reduce((sum, row) => sum + row.tokens, 0));
+  for (const row of [...rows].sort((a, b) => b.fraction - a.fraction || b.chars - a.chars || a.index - b.index)) {
+    if (remaining <= 0) break;
+    if (row.chars <= 0) continue;
+    row.tokens++;
+    remaining--;
+  }
+
+  // In pathological cases with more rounding remainder than non-empty rows, keep
+  // the invariant by assigning any leftover to the largest row.
+  while (remaining > 0 && rows.length > 0) {
+    const row = [...rows].sort((a, b) => b.chars - a.chars || a.index - b.index)[0];
+    row.tokens++;
+    remaining--;
+  }
+
+  return Object.fromEntries(rows.map((row) => [row.label, row.tokens]));
+}
+
 function triBreakdownLines(
   off: Breakdown,
   safe: Breakdown,
   full: Breakdown,
   totals: { off: number; safe: number; full: number },
 ): string[] {
-  const labels = [
-    "tool results",
-    "assistant thinking",
-    "assistant text",
-    "tool calls",
-    "custom messages",
-    "user messages",
-    "summaries",
-    "bash executions",
-    "assistant other",
-    "other",
-  ];
-  const dynamic = [...new Set([...Object.keys(off), ...Object.keys(safe), ...Object.keys(full)])]
-    .filter((label) => !labels.includes(label))
-    .sort();
-  const ordered = [...labels, ...dynamic].filter(
-    (label) => (off[label] ?? 0) > 0 || (safe[label] ?? 0) > 0 || (full[label] ?? 0) > 0,
-  );
+  const ordered = orderedBreakdownLabels(off, safe, full);
   const max = Math.max(1, ...ordered.map((label) => Math.max(off[label] ?? 0, safe[label] ?? 0, full[label] ?? 0)));
+  const offTok = approxTokensFromChars(totals.off);
+  const safeTok = approxTokensFromChars(totals.safe);
+  const fullTok = approxTokensFromChars(totals.full);
+  const offTokens = allocateApproxTokensByLabel(off, ordered, offTok);
+  const safeTokens = allocateApproxTokensByLabel(safe, ordered, safeTok);
+  const fullTokens = allocateApproxTokensByLabel(full, ordered, fullTok);
 
   const lines = ordered.flatMap((label) => {
     const o = off[label] ?? 0;
     const s = safe[label] ?? 0;
     const f = full[label] ?? 0;
-    const oTok = approxTokensFromChars(o);
-    const sTok = approxTokensFromChars(s);
-    const fTok = approxTokensFromChars(f);
+    const oTok = offTokens[label] ?? 0;
+    const sTok = safeTokens[label] ?? 0;
+    const fTok = fullTokens[label] ?? 0;
     return [
       `  ${label.padEnd(20)} ${colorBar(o, max, "off", 12)} ${fmtInt(oTok).padStart(9)} tok  off`,
       `  ${"".padEnd(20)} ${colorBar(s, max, "safe", 12)} ${fmtInt(sTok).padStart(9)} tok  safe saved ${fmtInt(Math.max(0, oTok - sTok))}`,
@@ -1736,9 +1772,6 @@ function triBreakdownLines(
     ];
   });
 
-  const offTok = approxTokensFromChars(totals.off);
-  const safeTok = approxTokensFromChars(totals.safe);
-  const fullTok = approxTokensFromChars(totals.full);
   lines.push(
     `  ${"total".padEnd(20)} ${colorBar(totals.off, Math.max(1, totals.off), "off", 12)} ${fmtInt(offTok).padStart(9)} tok  off`,
     `  ${"".padEnd(20)} ${colorBar(totals.safe, Math.max(1, totals.off), "safe", 12)} ${fmtInt(safeTok).padStart(9)} tok  safe saved ${fmtInt(Math.max(0, offTok - safeTok))}`,
@@ -2332,6 +2365,14 @@ function maybeTriggerCompaction(ctx: any) {
     },
   });
 }
+
+export const __testing = {
+  approxTokensFromChars,
+  orderedBreakdownLabels,
+  allocateApproxTokensByLabel,
+  contextBreakdown,
+  contextSize,
+};
 
 export default function cprune(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.3 - 2026-06-30
+
+### Fixed
+- Breakdown token buckets now allocate char→token rounding so the displayed per-category tokens sum exactly to the displayed `total` row.
+- Added tests asserting the breakdown token allocation reconciles with the total, including a rounding edge case.
+
 ## v0.4.2 - 2026-06-30
 
 ### Changed
