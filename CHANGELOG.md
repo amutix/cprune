@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.8 - 2026-06-30
+
+### Fixed
+- Provider cache-model detection now normalizes the provider slug before matching, so hyphenated/underscored names classify correctly (e.g. `z-ai` → content-cache; previously mis-detected as strict-prefix). This ensures the cache predictor and the prefix-freeze use the right model per provider.
+
 ## v0.2.7 - 2026-06-30
 
 ### Added

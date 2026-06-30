@@ -201,13 +201,16 @@ const emptyPrediction = (): CachePrediction => ({ prefixHitPct: 0, prefixMissTok
 function detectCacheModel(api: unknown, provider: unknown): CacheModel {
   const a = String(api ?? "").toLowerCase();
   const p = String(provider ?? "").toLowerCase();
+  const pn = p.replace(/[-_\s]/g, ""); // normalize "z-ai" -> "zai", "moonshot_ai" -> "moonshotai"
+  // Content/block reuse empirically observed on zai (glm) gateways: they re-serve
+  // unchanged messages after a prefix break, so retroactive pruning carries no
+  // cache penalty and aggressive full mode is safe there.
+  if (pn.includes("zai") || pn.includes("xiaomi") || pn.includes("kimi") || pn.includes("minimax")) return "content";
   // Prefix-sensitive caching: OpenAI family + Anthropic block cache + OpenAI-compatible routers.
   if (a.includes("openai") || a.includes("codex")) return "prefix";
   if (a.includes("anthropic") || p === "anthropic" || p.includes("bedrock")) return "prefix";
   if (a.includes("google") || p.includes("google")) return "prefix";
-  if (["deepseek", "groq", "cerebras", "together", "fireworks", "xai", "github-copilot", "mistral", "moonshotai", "openrouter"].includes(p)) return "prefix";
-  // Content/block reuse empirically observed on zai (glm) gateways.
-  if (p.includes("zai")) return "content";
+  if (["deepseek", "groq", "cerebras", "together", "fireworks", "xai", "github-copilot", "mistral", "moonshotai", "openrouter"].includes(pn)) return "prefix";
   return "auto";
 }
 let activeCacheModel: CacheModel = "auto";
