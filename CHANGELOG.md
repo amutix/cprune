@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.4 - 2026-06-30
+
+### Fixed
+- `/cprune` now explicitly explains the post-reload prefix-freeze state on prefix-cache providers. Because cprune does not persist the full frozen prompt (to avoid session-log bloat), immediately after a new/reloaded process the full row shows fresh next-prompt pruning until one model turn re-establishes the in-memory freeze.
+- Clarified the cache model line: prefix-cache full mode freezes the prefix **once established**.
+
 ## v0.3.3 - 2026-06-30
 
 ### Fixed

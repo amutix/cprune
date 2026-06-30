@@ -131,7 +131,7 @@ Prompt caching can make long sessions cheap when consecutive requests share a st
 
 cprune handles this carefully:
 
-- On **prefix-cache providers** such as OpenAI/gpt and Anthropic-style APIs, active `full` mode freezes the already-sent prefix. Only the new tail is aggressively pruned. This preserves prompt-cache stability.
+- On **prefix-cache providers** such as OpenAI/gpt and Anthropic-style APIs, active `full` mode freezes the already-sent prefix. Only the new tail is aggressively pruned. This preserves prompt-cache stability. The frozen prefix is in-memory; after a process reload it re-establishes after one model turn rather than being persisted as a huge prompt copy.
 - On **content-cache providers** such as zai/glm gateways, `full` mode stays fully aggressive because those providers can reuse unchanged blocks even after a prefix change.
 
 `/cprune` does **not** predict cache hit rates. Prediction turned out to be less reliable than the APIs themselves. Instead, cprune reports the real last-turn cache hit from provider usage data.

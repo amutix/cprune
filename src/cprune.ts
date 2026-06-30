@@ -1908,11 +1908,16 @@ function cacheImpactLines(): string[] {
   const modelLabel = activeCacheModel === "content"
     ? "content-cache (re-uses blocks after a change — full mode prunes freely)"
     : activeCacheModel === "prefix"
-      ? "prefix-cache (change invalidates the tail — full mode freezes its prefix)"
+      ? "prefix-cache (full mode freezes the prefix once established)"
       : "unknown cache model (prefix-cache assumed)";
   const lines = [`Cache model: ${modelLabel}`];
-  if (mode === "full" && activeCacheModel === "prefix" && committedPrefixCount > 0) {
-    lines.push("  note: full is shown with the active frozen prefix, because that is the prompt actually sent for cache stability.");
+  if (mode === "full" && activeCacheModel === "prefix") {
+    if (committedPrefixCount > 0) {
+      lines.push("  note: full is shown with the active frozen prefix, because that is the prompt actually sent for cache stability.");
+    } else {
+      lines.push("  note: prefix freeze is not established in this process yet (new/reloaded session);");
+      lines.push("        full is showing the fresh next-prompt form and will re-freeze after one model turn.");
+    }
   }
   return lines;
 }
