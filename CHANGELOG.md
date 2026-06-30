@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.13 - 2026-06-30
+
+### Changed
+- Reframed the cache section in the README as **cache preservation** (a known risk that cprune is designed to avoid) instead of a before/after remediation table.
+
 ## v0.2.12 - 2026-06-30
 
 ### Added

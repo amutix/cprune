@@ -32,17 +32,14 @@ Prompt caching makes long context cheap when consecutive turns share a stable pr
 
 This makes the cost/benefit of each mode visible in real sessions rather than only theoretical.
 
-## Measured cache impact
+## Cache preservation
 
-Prompt caching is where the real money is, so cprune measures it rather than guessing. Two findings from real sessions:
+A known risk with any context pruner: retroactively changing an already-sent message can invalidate the prompt cache. cprune is designed to avoid that penalty rather than cause it.
 
-| | before cache-aware mode | after |
-|---|---|---|
-| **gpt-5.5 (prefix-cache)** cache hit | 7–8% | **100%** |
-| **gpt-5.5** cost per turn | ~$0.50 | **~$0.09** |
-| **glm/zai (content-cache)** cache hit | 99% | **99%** (unchanged — no penalty) |
+- On **prefix-sensitive providers** (OpenAI/gpt, Anthropic), full mode **freezes the committed prefix** — once a message's pruned form is sent, that form is locked, so the cache prefix never breaks and only the new tail misses.
+- On **content-cache providers** (e.g. zai/glm gateways), which re-serve unchanged blocks after a change, full mode stays fully aggressive since retroactive changes carry no cache penalty there.
 
-The key fix: on **prefix-sensitive providers** (OpenAI/gpt, Anthropic), full mode now **freezes the committed prefix** — once a message's pruned form is sent, it's locked, so the cache prefix never breaks and only the new tail misses. On **content-cache providers** (zai/glm), which re-serve unchanged blocks after a change, full mode stays fully aggressive because retroactive changes carry no cache penalty there. `/cprune` reports both a provider-aware *predicted* hit and the *actual* `cacheRead` from the live response, so you can see the tradeoff in real sessions.
+`/cprune` reports both a provider-aware *predicted* cache hit (computed offline, no extra LLM calls) and the *actual* `cacheRead` from the live response, along with estimated cost savings, so the tradeoff is visible in real sessions rather than only theoretical.
 
 ## Safety and information loss
 
