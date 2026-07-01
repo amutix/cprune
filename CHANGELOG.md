@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.7 - 2026-06-30
+
+### Changed
+- Removed token count from `est. saved last turn`; the off/safe/full rows already show token deltas. The line now reports cost only.
+
 ## v0.4.6 - 2026-06-30
 
 ### Changed

@@ -2018,10 +2018,7 @@ function contextStatText(ctx: any): string {
   out.push(`  full  ${colorBar(full.after.chars, off.before.chars, "full")} ${fmtInt(full.after.approxTokens)} tok   −${fmtInt(fullSavedTok)}  ${fmtMoney(costSaved(full.after.approxTokens))}`);
 
   out.push("");
-  const savedLastTurnBits = lastTurnPromptSavings
-    ? [`${fmtInt(lastTurnPromptSavings.savedTokens)} tok`, fmtMoney(lastTurnCostSavedEstimate)]
-    : [fmtMoney(lastTurnCostSavedEstimate)];
-  out.push(`  est. saved last turn : ${savedLastTurnBits.join("  ·  ")}${costTag}`);
+  out.push(`  est. saved last turn : ${fmtMoney(lastTurnCostSavedEstimate)}${costTag}`);
   out.push(`  est. saved session   : ${fmtMoney(cumulativeCostSavedEstimate)}${costTag}`);
 
   out.push("");
