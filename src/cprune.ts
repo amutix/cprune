@@ -1974,21 +1974,14 @@ function estimateTurnCostSavings(): void {
 // cache model is shown (it explains why full mode freezes its prefix on
 // prefix-sensitive providers). The real hit lives in the "last turn" header line.
 function cacheImpactLines(): string[] {
-  const modelLabel = activeCacheModel === "content"
-    ? "content-cache (re-uses blocks after a change — full mode prunes freely)"
-    : activeCacheModel === "prefix"
-      ? "prefix-cache (full mode freezes the prefix once established)"
-      : "unknown cache model (prefix-cache assumed)";
-  const lines = [`Cache model: ${modelLabel}`];
-  if (mode === "full" && activeCacheModel === "prefix") {
-    if (committedPrefixCount > 0) {
-      lines.push("  note: full is shown with the active frozen prefix, because that is the prompt actually sent for cache stability.");
-    } else {
-      lines.push("  note: prefix freeze is not established in this process yet (new/reloaded session);");
-      lines.push("        full is showing the fresh next-prompt form and will re-freeze after one model turn.");
-    }
+  if (activeCacheModel === "content") return ["Cache: content-cache · full prunes freely"];
+  if (activeCacheModel === "prefix") {
+    const freeze = mode === "full"
+      ? (committedPrefixCount > 0 ? "full prefix frozen" : "full prefix not frozen yet")
+      : "prefix-sensitive";
+    return [`Cache: prefix-cache · ${freeze}`];
   }
-  return lines;
+  return ["Cache: unknown · prefix-cache assumed"];
 }
 
 function contextStatText(ctx: any): string {

@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.6 - 2026-06-30
+
+### Changed
+- Shortened the cache status line. Example: `Cache: prefix-cache · full prefix frozen` instead of a multi-line explanatory note.
+
 ## v0.4.5 - 2026-06-30
 
 ### Changed
