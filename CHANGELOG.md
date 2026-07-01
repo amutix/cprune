@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.5 - 2026-06-30
+
+### Changed
+- `/cprune` now reports `est. saved last turn` instead of `est. saved this turn`.
+- The last-turn savings line includes the actual prompt-token delta captured by the `context` hook for the model request that produced the last response, e.g. `15,888 tok · $0.0794`.
+- Internally, cprune now records pending prompt savings in the context hook and only promotes them to last-turn savings when `agent_end` receives a real model response. This avoids mixing current simulations, reload state, and stale usage data.
+
 ## v0.4.4 - 2026-06-30
 
 ### Changed

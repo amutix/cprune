@@ -27,7 +27,7 @@ cprune
    safe  ███████████████████████▏ 37,893 tok   −1,500  <$0.01
    full  █████████████████▋       28,897 tok   −10,496  $0.0525
 
-   est. saved this turn : $0.0525
+   est. saved last turn : 10,496 tok  ·  $0.0525
    est. saved session   : $5.48
 
    ...breakdown by context part...
@@ -41,7 +41,7 @@ Interpretation:
 - `safe` is the prompt size if safe mode were applied now.
 - `full` is the effective full-mode prompt size. On prefix-cache providers this includes the active frozen prefix, because that is what cprune actually sends to preserve cache stability.
 - `last turn` is the **actual provider-reported cache behavior** from the previous model call.
-- `est. saved this turn` is the actual prompt-token delta captured before the model call, priced with real billing data when available or clearly labeled assumed pricing otherwise.
+- `est. saved last turn` is the actual prompt-token delta captured for the model call that produced the last response, priced with real billing data when available or clearly labeled assumed pricing otherwise.
 - Because active `full` may keep an old prefix frozen, it can occasionally show less immediate savings than `safe`; that is a cache-preservation tradeoff, not a cache prediction.
 
 ## Install

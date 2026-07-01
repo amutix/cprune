@@ -205,6 +205,14 @@ type ActualUsage = {
   api?: string;
   provider?: string;
 };
+
+type PromptSavings = {
+  mode: CpruneMode;
+  rawTokens: number;
+  prunedTokens: number;
+  savedTokens: number;
+  capturedAt: number;
+};
 function detectCacheModel(api: unknown, provider: unknown): CacheModel {
   const a = String(api ?? "").toLowerCase();
   const p = String(provider ?? "").toLowerCase();
@@ -238,7 +246,8 @@ let committedPrefixRawHashes: string[] = [];
 // rate derived from the last response's billing.
 let cumulativeCostSavedEstimate = 0;
 let lastTurnCostSavedEstimate = 0;
-let lastPromptSavedTokens = 0;
+let pendingPromptSavings: PromptSavings | undefined;
+let lastTurnPromptSavings: PromptSavings | undefined;
 
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex");
@@ -856,6 +865,9 @@ function loadStateFromSession(ctx: any) {
   }
   cumulativeCostSavedEstimate = Number(stateEntry.data.cumulativeCostSavedEstimate ?? 0);
   lastTurnCostSavedEstimate = Number(stateEntry.data.lastTurnCostSavedEstimate ?? 0);
+  if (stateEntry.data.lastTurnPromptSavings && typeof stateEntry.data.lastTurnPromptSavings === "object") {
+    lastTurnPromptSavings = stateEntry.data.lastTurnPromptSavings;
+  }
 }
 
 function saveState(pi: ExtensionAPI) {
@@ -870,6 +882,7 @@ function saveState(pi: ExtensionAPI) {
     lastActualUsage,
     cumulativeCostSavedEstimate,
     lastTurnCostSavedEstimate,
+    lastTurnPromptSavings,
     savedAt: Date.now(),
   });
 }
@@ -1912,7 +1925,7 @@ function recordActualUsage(messages: AnyMessage[]): void {
   }
 }
 
-// Estimate $ saved this turn vs running in `off` mode, and accumulate it.
+// Estimate $ saved for the last completed model turn vs running in `off` mode, and accumulate it.
 // Price per uncached input token is derived from real billing when available.
 function pricePerMTokForModel(model: string | undefined): number {
   if (!model) return config.fallbackInputPricePerMTok;
@@ -1943,8 +1956,14 @@ function fmtMoney(value: number): string {
 
 function estimateTurnCostSavings(): void {
   const actual = lastActualUsage;
-  if (!actual) { lastTurnCostSavedEstimate = 0; return; }
-  const savedTokens = Math.max(0, lastPromptSavedTokens);
+  const prompt = pendingPromptSavings;
+  if (!actual || !prompt) {
+    lastTurnPromptSavings = undefined;
+    lastTurnCostSavedEstimate = 0;
+    return;
+  }
+  const savedTokens = Math.max(0, prompt.savedTokens);
+  lastTurnPromptSavings = prompt;
   const { rate } = inputRateFromUsage(actual);
   if (savedTokens <= 0 || rate <= 0) { lastTurnCostSavedEstimate = 0; return; }
   lastTurnCostSavedEstimate = savedTokens * rate;
@@ -2006,7 +2025,10 @@ function contextStatText(ctx: any): string {
   out.push(`  full  ${colorBar(full.after.chars, off.before.chars, "full")} ${fmtInt(full.after.approxTokens)} tok   −${fmtInt(fullSavedTok)}  ${fmtMoney(costSaved(full.after.approxTokens))}`);
 
   out.push("");
-  out.push(`  est. saved this turn : ${fmtMoney(lastTurnCostSavedEstimate)}${costTag}`);
+  const savedLastTurnBits = lastTurnPromptSavings
+    ? [`${fmtInt(lastTurnPromptSavings.savedTokens)} tok`, fmtMoney(lastTurnCostSavedEstimate)]
+    : [fmtMoney(lastTurnCostSavedEstimate)];
+  out.push(`  est. saved last turn : ${savedLastTurnBits.join("  ·  ")}${costTag}`);
   out.push(`  est. saved session   : ${fmtMoney(cumulativeCostSavedEstimate)}${costTag}`);
 
   out.push("");
@@ -2377,7 +2399,7 @@ export default function cprune(pi: ExtensionAPI) {
     committedPrefixCount = 0;
     committedPrefixForms = [];
     committedPrefixRawHashes = [];
-    lastPromptSavedTokens = 0;
+    pendingPromptSavings = undefined;
     ctx.ui.setStatus("cprune", `cprune: ${mode}`);
   });
 
@@ -2483,11 +2505,18 @@ export default function cprune(pi: ExtensionAPI) {
   pi.on("context", (event) => {
     const rawTokens = contextSize(event.messages).approxTokens;
     if (mode === "off") {
-      lastPromptSavedTokens = 0;
+      pendingPromptSavings = { mode, rawTokens, prunedTokens: rawTokens, savedTokens: 0, capturedAt: Date.now() };
       return;
     }
     const messages = contextHookPrune(event.messages, mode);
-    lastPromptSavedTokens = Math.max(0, rawTokens - contextSize(messages).approxTokens);
+    const prunedTokens = contextSize(messages).approxTokens;
+    pendingPromptSavings = {
+      mode,
+      rawTokens,
+      prunedTokens,
+      savedTokens: Math.max(0, rawTokens - prunedTokens),
+      capturedAt: Date.now(),
+    };
     return { messages };
   });
 
